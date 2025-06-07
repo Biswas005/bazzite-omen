@@ -1,24 +1,31 @@
 #!/bin/bash
+# In your build.sh file
 
-set -ouex pipefail
+# Install kernel development packages
+rpm-ostree install kernel-devel kernel-headers gcc make
 
-### Install packages
+# Build and install custom hp-wmi module
+KERNEL_VERSION=$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}')
+mkdir -p /tmp/hp-wmi-build
+cd /tmp/hp-wmi-build
 
-# Packages can be installed from any enabled yum repo on the image.
-# RPMfusion repos are available by default in ublue main images
-# List of rpmfusion packages can be found here:
-# https://mirrors.rpmfusion.org/mirrorlist?path=free/fedora/updates/39/x86_64/repoview/index.html&protocol=https&redirect=1
+# Copy and build module
+cp /ctx/hp-wmi.c .
+cat > Makefile << 'EOF'
+obj-m += hp-wmi.o
+KDIR := /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
 
-# this installs a package from fedora repos
-dnf5 install -y tmux 
+default:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+EOF
 
-# Use a COPR Example:
-#
-# dnf5 -y copr enable ublue-os/staging
-# dnf5 -y install package
-# Disable COPRs so they don't end up enabled on the final image:
-# dnf5 -y copr disable ublue-os/staging
+make
+find /lib/modules -name "hp-wmi.ko*" -exec cp {} {}.backup \;
+find /lib/modules -name "hp-wmi.ko*" -exec cp hp-wmi.ko {} \;
+depmod -a
 
-#### Example for enabling a System Unit File
+# Clean up
+cd / && rm -rf /tmp/hp-wmi-build
 
-systemctl enable podman.socket
+# Your other build commands...
