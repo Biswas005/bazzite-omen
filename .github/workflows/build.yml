@@ -59,6 +59,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+
+
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
@@ -73,7 +75,7 @@ jobs:
             --build-arg BAZZITE_MODULE_SIGNING_CRT="${{ secrets.BAZZITE_MODULE_SIGNING_CRT }}" \
             --build-arg BAZZITE_MODULE_SIGNING_DER="${{ secrets.BAZZITE_MODULE_SIGNING_DER }}" \
             --build-arg BASE_IMAGE="${{ matrix.image-flavor.base }}" \
-            -t "${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.image-flavor.suffix }}:latest" \
+            -t "${{ steps.registry_case.outputs.lowercase }}/${{ steps.image_case.outputs.lowercase }}${{ matrix.image-flavor.suffix }}:latest" \
             .
 
       # Image metadata for https://artifacthub.io/ - This is optional but is highly recommended so we all can get a index of all the custom images
