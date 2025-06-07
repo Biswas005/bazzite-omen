@@ -325,20 +325,6 @@ else
     fi
 fi
 
-# Install Rust
-################
-
-echo "Installing Rust (non-interactively)..."
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-
-# Add Rust to PATH for current session
-export PATH="$HOME/.cargo/bin:$PATH"
-
-# Add Rust to system-wide PATH
-echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> /etc/profile.d/rust.sh
-chmod +x /etc/profile.d/rust.sh
-
-echo "✓ Rust installed successfully"
 
 # Install/Remove Browsers
 ###########################
