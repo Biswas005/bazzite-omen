@@ -13,6 +13,45 @@ else
     echo "✓ Regular base image detected - will install NVIDIA drivers"
 fi
 
+# Get kernel version and set up build environment
+KERNEL_VERSION=$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}')
+echo "Building for kernel version: $KERNEL_VERSION"
+
+# Find kernel source directory
+KERNEL_SRC_DIR="/usr/src/kernels/$KERNEL_VERSION"
+if [ ! -d "$KERNEL_SRC_DIR" ]; then
+    KERNEL_SRC_DIR=$(find /usr/src/kernels -maxdepth 1 -type d -name "*" | grep -v "^/usr/src/kernels$" | head -1)
+    if [ -z "$KERNEL_SRC_DIR" ] || [ ! -d "$KERNEL_SRC_DIR" ]; then
+        echo "ERROR: Kernel source directory not found"
+        exit 1
+    fi
+fi
+echo "Using kernel source: $KERNEL_SRC_DIR"
+
+# Create build directory
+BUILD_DIR="/tmp/hp-wmi-build"
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
+
+# Copy custom hp-wmi.c source
+if [ ! -f "/ctx/hp-wmi.c" ]; then
+    echo "ERROR: hp-wmi.c source file not found at /ctx/hp-wmi.c"
+    exit 1
+fi
+cp /ctx/hp-wmi.c .
+cp /ctx/module-signing.crt .
+cp /ctx/module-signing.der .
+# Check if hp-wmi.c was copied successfully
+if [ ! -f "hp-wmi.c" ]; then
+    echo "ERROR: Failed to copy hp-wmi.c to build directory"
+    exit 1
+fi
+# Check if module-signing.crt and module-signing.der were copied successfully
+if [ ! -f "module-signing.crt" ] || [ ! -f "module-signing.der" ]; then
+    echo "ERROR: Failed to copy module-signing.crt or module-signing.der to build directory"
+    exit 1
+fi
+
 # Persistent Key Management Setup
 ##################################
 
@@ -132,18 +171,6 @@ echo "Fingerprint: $(openssl x509 -in /etc/pki/module-signing/module-signing.crt
 
 # Build Custom HP-WMI Module
 #############################
-
-# Create build directory
-BUILD_DIR="/tmp/hp-wmi-build"
-mkdir -p "$BUILD_DIR"
-cd "$BUILD_DIR"
-
-# Copy custom hp-wmi.c source
-if [ ! -f "/ctx/hp-wmi.c" ]; then
-    echo "ERROR: hp-wmi.c source file not found at /ctx/hp-wmi.c"
-    exit 1
-fi
-cp /ctx/hp-wmi.c .
 
 # Create Makefile
 cat > Makefile << EOF
