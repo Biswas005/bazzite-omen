@@ -1,10 +1,15 @@
 ---
 name: Build Bazzite-Omen ISO
-# This workflow builds the Bazzite-Omen ISO images using bootc-image-builder
+# This workflow builds the Bazzite-Omen ISO images using bootc-image-builder directly
 
 on:
   workflow_dispatch:
     inputs:
+      upload-to-s3:
+        description: "Upload to S3"
+        required: false
+        default: false
+        type: boolean
       platform:
         required: true
         type: choice
@@ -61,18 +66,43 @@ jobs:
           echo "IMAGE_REGISTRY=${IMAGE_REGISTRY,,}" >> ${GITHUB_ENV}
           echo "IMAGE_NAME=${IMAGE_NAME,,}" >> ${GITHUB_ENV}
       
-      - name: Install dependencies (ARM64)
-        if: matrix.platform == 'arm64'
+      - name: Install dependencies
         run: |
           set -x
           sudo apt update -y
-          sudo apt install -y podman
+          sudo apt install -y \
+            podman \
+            qemu-user-static \
+            systemd-container
 
-      - name: Maximize build space (AMD64)
+      - name: Maximize build space (AMD64 only)
         if: matrix.platform != 'arm64'
-        uses: ublue-os/remove-unwanted-software@cc0becac701cf642c8f0a6613bbdaf5dc36b259e # v9
-        with:
-          remove-codeql: true
+        run: |
+          # Remove unnecessary packages to free up space
+          sudo apt-get remove -y \
+            azure-cli \
+            google-chrome-stable \
+            firefox \
+            powershell \
+            mono-devel \
+            dotnet-* \
+            llvm-* \
+            mysql-* \
+            postgresql-* \
+            mongodb-* \
+            snapd \
+            docker-* \
+            containerd.io
+          sudo apt-get autoremove -y
+          sudo apt-get autoclean
+          
+          # Clean up additional space
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          
+          df -h
 
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
@@ -108,40 +138,86 @@ jobs:
           ]
           EOF
 
-      - name: Build Bazzite-Omen ISO
+      - name: Setup output directory
+        run: |
+          mkdir -p ./output
+          echo "OUTPUT_DIR=$(pwd)/output" >> $GITHUB_ENV
+
+      - name: Build Bazzite-Omen ISO using bootc-image-builder directly
         id: build
-        uses: ublue-os/bootc-image-builder-action@main
-        with:
-          bootc-image-builder-image: quay.io/ublue-os/bootc-image-builder:latest
-          use-librepo: true
-          rootfs: btrfs
-          config-file: ./iso-${{ matrix.variant.name }}.toml
-          image: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}:${{ env.DEFAULT_TAG }}
-          architecture: ${{ matrix.platform }}
+        run: |
+          set -x
+          
+          # Pull the bootc-image-builder container
+          podman pull ghcr.io/centos-workstation/bootc-image-builder:latest
+          
+          # Set architecture for container
+          ARCH="${{ matrix.platform }}"
+          if [ "$ARCH" = "amd64" ]; then
+            ARCH="x86_64"
+          elif [ "$ARCH" = "arm64" ]; then
+            ARCH="aarch64"
+          fi
+          
+          # Create the build command
+          BUILD_CMD="podman run --rm -it --privileged \
+            --pull=newer \
+            --security-opt label=type:unconfined_t \
+            -v $(pwd)/iso-${{ matrix.variant.name }}.toml:/config.toml:ro \
+            -v ${{ env.OUTPUT_DIR }}:/output \
+            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            ghcr.io/centos-workstation/bootc-image-builder:latest \
+            --type iso \
+            --arch ${ARCH} \
+            --config /config.toml \
+            --rootfs btrfs \
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}${{ matrix.variant.suffix }}:${{ env.DEFAULT_TAG }}"
+          
+          echo "Running: $BUILD_CMD"
+          eval $BUILD_CMD
+          
+          # Set output for next steps
+          echo "output-directory=${{ env.OUTPUT_DIR }}" >> $GITHUB_OUTPUT
+          
+          # List what was created
+          echo "Build completed, contents of output directory:"
+          ls -la ${{ env.OUTPUT_DIR }}/
 
       - name: Move and rename ISO files
         if: steps.build.outcome == 'success'
         shell: bash
         run: |
+          cd ${{ env.OUTPUT_DIR }}
+          
           # Create a descriptive filename
           ISO_NAME="bazzite-omen-${{ matrix.variant.name }}-${{ steps.date.outputs.date }}-${{ matrix.platform }}"
           
           # Find the ISO file and rename it
-          if [ -f "${{ steps.build.outputs.output-directory }}/bootiso/install.iso" ]; then
-            mv "${{ steps.build.outputs.output-directory }}/bootiso/install.iso" \
-               "${{ steps.build.outputs.output-directory }}/${ISO_NAME}.iso"
+          ISO_FILE=$(find . -name "*.iso" -type f | head -1)
+          if [ -n "$ISO_FILE" ] && [ -f "$ISO_FILE" ]; then
+            echo "Found ISO file: $ISO_FILE"
+            mv "$ISO_FILE" "${ISO_NAME}.iso"
+            echo "Renamed to: ${ISO_NAME}.iso"
+          else
+            echo "No ISO file found in output directory"
+            ls -la
+            exit 1
           fi
           
           # Create checksums
-          cd "${{ steps.build.outputs.output-directory }}"
           if [ -f "${ISO_NAME}.iso" ]; then
             sha256sum "${ISO_NAME}.iso" > "${ISO_NAME}.iso.sha256"
             echo "iso_filename=${ISO_NAME}.iso" >> $GITHUB_OUTPUT
+            echo "Created checksum file: ${ISO_NAME}.iso.sha256"
           fi
+          
+          # Show final results
+          echo "Final output files:"
+          ls -la *.iso* || true
         id: rename
 
       - name: Upload ISO to Job Artifacts
-        if: steps.build.outcome == 'success'
+        if: steps.build.outcome == 'success' && inputs.upload-to-s3 != true && github.event_name != 'pull_request'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bazzite-omen-iso-${{ matrix.variant.name }}-${{ steps.date.outputs.date }}-${{ matrix.platform }}
@@ -153,6 +229,22 @@ jobs:
           compression-level: 0
           overwrite: true
 
+      - name: Upload to S3
+        if: steps.build.outcome == 'success' && inputs.upload-to-s3 == true && github.event_name != 'pull_request'
+        shell: bash
+        env:
+          RCLONE_CONFIG_S3_TYPE: s3
+          RCLONE_CONFIG_S3_PROVIDER: ${{ secrets.S3_PROVIDER }}
+          RCLONE_CONFIG_S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_S3_REGION: ${{ secrets.S3_REGION }}
+          RCLONE_CONFIG_S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          SOURCE_DIR: ${{ steps.build.outputs.output-directory }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone
+          rclone copy $SOURCE_DIR S3:${{ secrets.S3_BUCKET_NAME }}
+
       - name: Create Release Summary
         if: steps.build.outcome == 'success'
         run: |
@@ -161,7 +253,7 @@ jobs:
           echo "### Build Details:" >> $GITHUB_STEP_SUMMARY
           echo "- **Platform**: ${{ matrix.platform }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Variant**: ${{ matrix.variant.name }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Date**: ${{ steps.date.outputs.date }}" >> $GITHUB_OUTPUT
+          echo "- **Date**: ${{ steps.date.outputs.date }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Base Image**: Bazzite ${{ matrix.variant.name }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Target**: HP Omen Gaming Laptops" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -172,4 +264,8 @@ jobs:
             echo "- Checksum: \`${{ steps.rename.outputs.iso_filename }}.sha256\`" >> $GITHUB_STEP_SUMMARY
           fi
           
-          echo "- **Status**: ✅ Available in Job Artifacts" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.upload-to-s3 }}" == "true" ]; then
+            echo "- **Status**: ✅ Uploaded to S3" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Status**: ✅ Available in Job Artifacts" >> $GITHUB_STEP_SUMMARY
+          fi
