@@ -17,7 +17,7 @@ on:
 env:
   IMAGE_NAME: "${{ github.event.repository.name }}"
   IMAGE_DESC: "My Customized Universal Blue Image"
-  IMAGE_REGISTRY: "ghcr.io/ghcr.io/biswas005"
+  IMAGE_REGISTRY: "ghcr.io/biswas005"
   ARTIFACTHUB_LOGO_URL: "https://avatars.githubusercontent.com/u/120078124?s=200&v=4"
   BAZZITE_MODULE_SIGNING_KEY: ${{ secrets.BAZZITE_MODULE_SIGNING_KEY }}
   BAZZITE_MODULE_SIGNING_CRT: ${{ secrets.BAZZITE_MODULE_SIGNING_CRT }}
