@@ -159,13 +159,25 @@ jobs:
             ARCH="aarch64"
           fi
           
-          # Create the build command
-          BUILD_CMD="podman run --rm -it --privileged \
+          # Create temporary storage directory for podman
+          mkdir -p ${HOME}/.local/share/containers/storage
+          
+          # Create the build command without TTY flags and storage mount
+          BUILD_CMD="podman run --rm --privileged \
             --pull=newer \
             --security-opt label=type:unconfined_t \
+            --device /dev/loop-control \
+            --device /dev/loop0 \
+            --device /dev/loop1 \
+            --device /dev/loop2 \
+            --device /dev/loop3 \
+            --device /dev/loop4 \
+            --device /dev/loop5 \
+            --device /dev/loop6 \
+            --device /dev/loop7 \
             -v $(pwd)/iso-${{ matrix.variant.name }}.toml:/config.toml:ro \
             -v ${{ env.OUTPUT_DIR }}:/output \
-            -v /var/lib/containers/storage:/var/lib/containers/storage \
+            -v ${HOME}/.local/share/containers/storage:/var/lib/containers/storage \
             ghcr.io/centos-workstation/bootc-image-builder:latest \
             --type iso \
             --arch ${ARCH} \
