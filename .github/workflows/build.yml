@@ -36,7 +36,7 @@ jobs:
             suffix: ""
           - name: "nvidia"
             base: "ghcr.io/ublue-os/bazzite-deck-nvidia:latest"
-            suffix: "-nvidia"
+            suffix: ""
 
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ matrix.image-flavor.name }}
