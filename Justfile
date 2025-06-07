@@ -1,9 +1,15 @@
+# Bazzite-specific environment variables
 export repo_organization := env("GITHUB_REPOSITORY_OWNER", "yourname")
-export image_name := env("IMAGE_NAME", "yourimage")
-export centos_version := env("CENTOS_VERSION", "stream10")
-export fedora_version := env("CENTOS_VERSION", "41")
+export image_name := env("IMAGE_NAME", "bazzite-omen")  # Changed from "yourimage"
+export fedora_version := env("FEDORA_VERSION", "41")     # Bazzite uses Fedora, not CentOS
 export default_tag := env("DEFAULT_TAG", "latest")
-export bib_image := env("BIB_IMAGE", "quay.io/ublue-os/bootc-image-builder:bazzite-42")
+export bib_image := env("BIB_IMAGE", "quay.io/ublue-os/bootc-image-builder:latest")
+
+# Bazzite base images to choose from:
+# - ghcr.io/ublue-os/bazzite (standard Bazzite)
+# - ghcr.io/ublue-os/bazzite-nvidia (Bazzite with NVIDIA drivers)
+# - ghcr.io/ublue-os/bazzite-deck (Steam Deck specific)
+export base_image := env("BASE_IMAGE", "ghcr.io/ublue-os/bazzite-nvidia")
 
 alias build-vm := build-qcow2
 alias rebuild-vm := rebuild-qcow2
@@ -71,50 +77,47 @@ sudoif command *args:
     }
     sudoif {{ command }} {{ args }}
 
-# This Justfile recipe builds a container image using Podman.
+# Build Bazzite-based image with HP Omen customizations
 #
 # Arguments:
-#   $target_image - The tag you want to apply to the image (default: aurora).
-#   $tag - The tag for the image (default: lts).
-#   $dx - Enable DX (default: "0").
-#   $hwe - Enable HWE (default: "0").
-#   $gdx - Enable GDX (default: "0").
-#
-# DX:
-#   Developer Experience (DX) is a feature that allows you to install the latest developer tools for your system.
-#   Packages include VScode, Docker, Distrobox, and more.
-# HWE:
-#   Hardware Enablement (HWE) is a feature that allows you to install the latest hardware support for your system.
-#   Currently this install the Hyperscale SIG kernel which will stay ahead of the CentOS Stream kernel and enables btrfs
-# GDX: https://docs.projectaurora.io/gdx/
-#   GPU Developer Experience (GDX) creates a base as an AI and Graphics platform.
-#   Installs Nvidia drivers, CUDA, and other tools.
+#   $target_image - The tag you want to apply to the image (default: bazzite-omen).
+#   $tag - The tag for the image (default: latest).
+#   $nvidia - Use NVIDIA base image (default: "1" for HP Omen gaming laptops).
+#   $deck - Use Steam Deck optimizations (default: "0").
 #
 # The script constructs the version string using the tag and the current date.
 # If the git working directory is clean, it also includes the short SHA of the current HEAD.
 #
-# just build $target_image $tag $dx $hwe $gdx
-#
 # Example usage:
-#   just build aurora lts 1 0 1
+#   just build bazzite-omen latest 1 0
 #
-# This will build an image 'aurora:lts' with DX and GDX enabled.
-#
+# This will build a 'bazzite-omen:latest' image with NVIDIA support for HP Omen laptops.
 
-# Build the image using the specified parameters
-build $target_image=image_name $tag=default_tag $dx="1" $hwe="0" $gdx="1":
+# Build the Bazzite-based image with HP Omen customizations
+build $target_image=image_name $tag=default_tag $nvidia="1" $deck="0":
     #!/usr/bin/env bash
 
+    # Determine base image based on options
+    if [[ "${deck}" == "1" ]]; then
+        BASE_IMG="ghcr.io/ublue-os/bazzite-deck"
+        echo "Using Steam Deck base image"
+    elif [[ "${nvidia}" == "1" ]]; then
+        BASE_IMG="ghcr.io/ublue-os/bazzite-nvidia"
+        echo "Using NVIDIA base image for gaming laptops"
+    else
+        BASE_IMG="ghcr.io/ublue-os/bazzite"
+        echo "Using standard Bazzite base image"
+    fi
+
     # Get Version
-    ver="${tag}-${centos_version}.$(date +%Y%m%d)"
+    ver="${tag}-${fedora_version}.$(date +%Y%m%d)"
 
     BUILD_ARGS=()
-    BUILD_ARGS+=("--build-arg" "MAJOR_VERSION=${centos_version}")
+    BUILD_ARGS+=("--build-arg" "FEDORA_MAJOR_VERSION=${fedora_version}")
+    BUILD_ARGS+=("--build-arg" "BASE_IMAGE=${BASE_IMG}")
     BUILD_ARGS+=("--build-arg" "IMAGE_NAME=${target_image}")
     BUILD_ARGS+=("--build-arg" "IMAGE_VENDOR=${repo_organization}")
-    BUILD_ARGS+=("--build-arg" "ENABLE_DX=${dx}")
-    BUILD_ARGS+=("--build-arg" "ENABLE_HWE=${hwe}")
-    BUILD_ARGS+=("--build-arg" "ENABLE_GDX=${gdx}")
+    
     if [[ -z "$(git status -s)" ]]; then
         BUILD_ARGS+=("--build-arg" "SHA_HEAD_SHORT=$(git rev-parse --short HEAD)")
     fi
@@ -125,23 +128,17 @@ build $target_image=image_name $tag=default_tag $dx="1" $hwe="0" $gdx="1":
         --tag "${target_image}:${tag}" \
         .
 
-# Command: _rootful_load_image
-# Description: This script checks if the current user is root or running under sudo. If not, it attempts to resolve the image tag using podman inspect.
-#              If the image is found, it loads it into rootful podman. If the image is not found, it pulls it from the repository.
-#
-# Parameters:
-#   $target_image - The name of the target image to be loaded or pulled.
-#   $tag - The tag of the target image to be loaded or pulled. Default is 'default_tag'.
-#
-# Example usage:
-#   _rootful_load_image my_image latest
-#
-# Steps:
-# 1. Check if the script is already running as root or under sudo.
-# 2. Check if target image is in the non-root podman container storage)
-# 3. If the image is found, load it into rootful podman using podman scp.
-# 4. If the image is not found, pull it from the remote repository into reootful podman.
+# Build specifically for HP Omen laptops (with NVIDIA)
+[group('Build')]
+build-omen $target_image=("bazzite-omen") $tag=default_tag: 
+    just build {{target_image}} {{tag}} 1 0
 
+# Build for Steam Deck (if you want to test on Deck)
+[group('Build')]
+build-deck $target_image=("bazzite-omen-deck") $tag=default_tag:
+    just build {{target_image}} {{tag}} 0 1
+
+# Command: _rootful_load_image (same as original)
 _rootful_load_image $target_image=image_name $tag=default_tag:
     #!/usr/bin/bash
     set -eoux pipefail
@@ -175,14 +172,6 @@ _rootful_load_image $target_image=image_name $tag=default_tag:
     fi
 
 # Build a bootc bootable image using Bootc Image Builder (BIB)
-# Converts a container image to a bootable image
-# Parameters:
-#   target_image: The name of the image to build (ex. localhost/fedora)
-#   tag: The tag of the image to build (ex. latest)
-#   type: The type of image to build (ex. qcow2, raw, iso)
-#   config: The configuration file to use for the build (default: image.toml)
-
-# Example: just _rebuild-bib localhost/fedora latest qcow2 image.toml
 _build-bib $target_image $tag $type $config: (_rootful_load_image target_image tag)
     #!/usr/bin/env bash
     set -euo pipefail
@@ -217,37 +206,30 @@ _build-bib $target_image $tag $type $config: (_rootful_load_image target_image t
     sudo chown -R $USER:$USER output/
 
 # Podman builds the image from the Containerfile and creates a bootable image
-# Parameters:
-#   target_image: The name of the image to build (ex. localhost/fedora)
-#   tag: The tag of the image to build (ex. latest)
-#   type: The type of image to build (ex. qcow2, raw, iso)
-#   config: The configuration file to use for the build (deafult: image.toml)
-
-# Example: just _rebuild-bib localhost/fedora latest qcow2 image.toml
 _rebuild-bib $target_image $tag $type $config: (build target_image tag) && (_build-bib target_image tag type config)
 
 # Build a QCOW2 virtual machine image
-[group('Build Virtal Machine Image')]
+[group('Build Virtual Machine Image')]
 build-qcow2 $target_image=("localhost/" + image_name) $tag=default_tag: && (_build-bib target_image tag "qcow2" "image.toml")
 
-# Build a RAW virtual machine image
-[group('Build Virtal Machine Image')]
+# Build a RAW virtual machine image  
+[group('Build Virtual Machine Image')]
 build-raw $target_image=("localhost/" + image_name) $tag=default_tag: && (_build-bib target_image tag "raw" "image.toml")
 
 # Build an ISO virtual machine image
-[group('Build Virtal Machine Image')]
+[group('Build Virtual Machine Image')]
 build-iso $target_image=("localhost/" + image_name) $tag=default_tag: && (_build-bib target_image tag "iso" "iso.toml")
 
 # Rebuild a QCOW2 virtual machine image
-[group('Build Virtal Machine Image')]
+[group('Build Virtual Machine Image')]
 rebuild-qcow2 $target_image=("localhost/" + image_name) $tag=default_tag: && (_rebuild-bib target_image tag "qcow2" "image.toml")
 
 # Rebuild a RAW virtual machine image
-[group('Build Virtal Machine Image')]
+[group('Build Virtual Machine Image')]
 rebuild-raw $target_image=("localhost/" + image_name) $tag=default_tag: && (_rebuild-bib target_image tag "raw" "image.toml")
 
 # Rebuild an ISO virtual machine image
-[group('Build Virtal Machine Image')]
+[group('Build Virtual Machine Image')]
 rebuild-iso $target_image=("localhost/" + image_name) $tag=default_tag: && (_rebuild-bib target_image tag "iso" "iso.toml")
 
 # Run a virtual machine with the specified image type and configuration
@@ -283,7 +265,7 @@ _run-vm $target_image $tag $type $config:
     run_args+=(--env "RAM_SIZE=8G")
     run_args+=(--env "DISK_SIZE=64G")
     run_args+=(--env "TPM=Y")
-    run_args+=(--env "GPU=Y")
+    run_args+=(--env "GPU=Y")  # GPU passthrough for gaming
     run_args+=(--device=/dev/kvm)
     run_args+=(--volume "${PWD}/${image_file}":"/boot.${type}")
     run_args+=(docker.io/qemux/qemu)
@@ -293,19 +275,19 @@ _run-vm $target_image $tag $type $config:
     podman run "${run_args[@]}"
 
 # Run a virtual machine from a QCOW2 image
-[group('Run Virtal Machine')]
+[group('Run Virtual Machine')]
 run-vm-qcow2 $target_image=("localhost/" + image_name) $tag=default_tag: && (_run-vm target_image tag "qcow2" "image.toml")
 
 # Run a virtual machine from a RAW image
-[group('Run Virtal Machine')]
+[group('Run Virtual Machine')]
 run-vm-raw $target_image=("localhost/" + image_name) $tag=default_tag: && (_run-vm target_image tag "raw" "image.toml")
 
 # Run a virtual machine from an ISO
-[group('Run Virtal Machine')]
+[group('Run Virtual Machine')]
 run-vm-iso $target_image=("localhost/" + image_name) $tag=default_tag: && (_run-vm target_image tag "iso" "iso.toml")
 
 # Run a virtual machine using systemd-vmspawn
-[group('Run Virtal Machine')]
+[group('Run Virtual Machine')]
 spawn-vm rebuild="0" type="qcow2" ram="6G":
     #!/usr/bin/env bash
 
@@ -314,14 +296,13 @@ spawn-vm rebuild="0" type="qcow2" ram="6G":
     [ "{{ rebuild }}" -eq 1 ] && echo "Rebuilding the ISO" && just build-vm {{ rebuild }} {{ type }}
 
     systemd-vmspawn \
-      -M "bootc-image" \
+      -M "bazzite-omen-vm" \
       --console=gui \
-      --cpus=2 \
+      --cpus=4 \
       --ram=$(echo {{ ram }}| /usr/bin/numfmt --from=iec) \
       --network-user-mode \
       --vsock=false --pass-ssh-key=false \
       -i ./output/**/*.{{ type }}
-
 
 # Runs shell check on all Bash scripts
 lint:
