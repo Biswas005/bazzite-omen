@@ -102,7 +102,7 @@ sudoif command *args:
 #
 
 # Build the image using the specified parameters
-build $target_image=image_name $tag=default_tag $dx="0" $hwe="0" $gdx="1":
+build $target_image=image_name $tag=default_tag $dx="1" $hwe="0" $gdx="1":
     #!/usr/bin/env bash
 
     # Get Version
