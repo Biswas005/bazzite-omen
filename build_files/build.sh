@@ -79,9 +79,11 @@ echo "hp-wmi module replacement completed successfully!"
 ### Additional customizations
 # Install other packages you need
 dnf5 install -y tmux
-dnf installn-y dnf-plugins-core
-dnf config-manager addrepo --from-repofile=https://brave-browser-rpm-release.s3.brave.com/brave-browser.repo -y
-dnf install brave-browser -y
+
+dnf5 install -y dnf-plugins-core
+dnf5 config-manager addrepo --from-repofile=https://brave-browser-rpm-release.s3.brave.com/brave-browser.repo
+dnf5 install -y brave-browser
+
 
 # Enable services
 systemctl enable podman.socket
