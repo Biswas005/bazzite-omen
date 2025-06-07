@@ -1,6 +1,18 @@
 #!/bin/bash
 set -ouex pipefail
 
+echo "Build script starting..."
+echo "Base image: ${BASE_IMAGE:-unknown}"
+
+# Check if we're building on a NVIDIA-enabled base image
+NVIDIA_BASE=false
+if [[ "${BASE_IMAGE:-}" == *"nvidia"* ]]; then
+    NVIDIA_BASE=true
+    echo "✓ NVIDIA base image detected - skipping NVIDIA driver installation"
+else
+    echo "✓ Regular base image detected - will install NVIDIA drivers"
+fi
+
 # Persistent Key Management Setup
 ##################################
 
@@ -36,14 +48,29 @@ setup_github_secrets_keys() {
     fi
 }
 
-# Install packages
-echo "Installing build dependencies and NVIDIA support..."
+# Install base packages (always needed)
+echo "Installing build dependencies..."
 dnf5 install -y kernel-devel kernel-headers gcc make kmod openssl mokutil elfutils-libelf-devel tmux
 
-# Install akmods first, then NVIDIA packages
-echo "Installing akmods and NVIDIA drivers..."
-dnf5 install -y akmods
-dnf5 install -y akmod-nvidia xorg-x11-drv-nvidia nvidia-settings cuda-devel
+# Conditional NVIDIA Installation
+##################################
+
+if [ "$NVIDIA_BASE" = false ]; then
+    echo "Installing akmods and NVIDIA drivers..."
+    dnf5 install -y akmods
+    
+    # Try to install NVIDIA packages, but don't fail if they're not available
+    if dnf5 install -y akmod-nvidia xorg-x11-drv-nvidia nvidia-settings cuda-devel; then
+        echo "✓ NVIDIA packages installed successfully"
+        NVIDIA_INSTALLED=true
+    else
+        echo "⚠️  Some NVIDIA packages failed to install - continuing anyway"
+        NVIDIA_INSTALLED=false
+    fi
+else
+    echo "✓ Skipping NVIDIA driver installation (already present in base image)"
+    NVIDIA_INSTALLED=false  # Don't try to sign NVIDIA modules later
+fi
 
 # Get kernel version and set up build environment
 KERNEL_VERSION=$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}')
@@ -102,6 +129,9 @@ fi
 echo "Certificate Information:"
 echo "Subject: $(openssl x509 -in /etc/pki/module-signing/module-signing.crt -noout -subject)"
 echo "Fingerprint: $(openssl x509 -in /etc/pki/module-signing/module-signing.crt -fingerprint -noout)"
+
+# Build Custom HP-WMI Module
+#############################
 
 # Create build directory
 BUILD_DIR="/tmp/hp-wmi-build"
@@ -166,9 +196,7 @@ for module_path in $(find /lib/modules -name "hp-wmi.ko*" 2>/dev/null); do
     echo "Backing up existing module: $module_path"
     cp "$module_path" "$module_path.backup"
     echo "Replacing module: $module_path"
-    cp hp-wmi.ko涅
-
-System: wmi.ko "$module_path"
+    cp hp-wmi.ko "$module_path"
     MODULE_INSTALLED=true
 done
 
@@ -204,64 +232,72 @@ rm -rf "$BUILD_DIR"
 
 echo "hp-wmi module installation completed successfully!"
 
-# Build and Sign NVIDIA Modules
-##################################
+# Conditional NVIDIA Module Building and Signing
+##################################################
 
-echo "Building and signing NVIDIA modules..."
+if [ "$NVIDIA_INSTALLED" = true ]; then
+    echo "Building and signing NVIDIA modules..."
 
-# Force akmods to build NVIDIA modules for current kernel
-echo "Running akmods to build NVIDIA modules..."
-akmods --force
+    # Force akmods to build NVIDIA modules for current kernel
+    echo "Running akmods to build NVIDIA modules..."
+    akmods --force
 
-# Wait for akmods to complete and update module dependencies
-depmod -a "$KERNEL_VERSION"
-
-# Find and sign NVIDIA modules
-echo "Signing NVIDIA modules with persistent keys..."
-NVIDIA_MODULES_FOUND=false
-
-# Common locations for NVIDIA modules
-NVIDIA_SEARCH_PATHS=(
-    "/lib/modules/$KERNEL_VERSION/extra/nvidia"
-    "/lib/modules/$KERNEL_VERSION/kernel/drivers/video"
-    "/lib/modules/$KERNEL_VERSION/weak-updates/nvidia"
-    "/usr/lib/modules/$KERNEL_VERSION/extra/nvidia"
-)
-
-for search_path in "${NVIDIA_SEARCH_PATHS[@]}"; do
-    if [ -d "$search_path" ]; then
-        echo "Found NVIDIA modules in: $search_path"
-        for ko_file in $(find "$search_path" -name "*.ko" 2>/dev/null); do
-            echo "Signing NVIDIA module: $(basename $ko_file)"
-            if [ -f "$KERNEL_SRC_DIR/scripts/sign-file" ]; then
-                $KERNEL_SRC_DIR/scripts/sign-file sha256 \
-                    /etc/pki/module-signing/module-signing.key \
-                    /etc/pki/module-signing/module-signing.crt \
-                    "$ko_file"
-                NVIDIA_MODULES_FOUND=true
-            fi
-        done
-    fi
-done
-
-# Also check for NVIDIA modules in standard kernel locations
-for ko_file in $(find /lib/modules/$KERNEL_VERSION -name "nvidia.ko" 2>/dev/null); do
-    echo "Signing NVIDIA module: $(basename $ko_file)"
-    if [ -f "$KERNEL_SRC_DIR/scripts/sign-file" ]; then
-        $KERNEL_SRC_DIR/scripts/sign-file sha256 \
-            /etc/pki/module-signing/module-signing.key \
-            /etc/pki/module-signing/module-signing.crt \
-            "$ko_file"
-        NVIDIA_MODULES_FOUND=true
-    fi
-done
-
-if [ "$NVIDIA_MODULES_FOUND" = true ]; then
-    echo "✓ NVIDIA modules signed successfully"
-    # Update module dependencies after signing
+    # Wait for akmods to complete and update module dependencies
     depmod -a "$KERNEL_VERSION"
+
+    # Find and sign NVIDIA modules
+    echo "Signing NVIDIA modules with persistent keys..."
+    NVIDIA_MODULES_FOUND=false
+
+    # Common locations for NVIDIA modules
+    NVIDIA_SEARCH_PATHS=(
+        "/lib/modules/$KERNEL_VERSION/extra/nvidia"
+        "/lib/modules/$KERNEL_VERSION/kernel/drivers/video"
+        "/lib/modules/$KERNEL_VERSION/weak-updates/nvidia"
+        "/usr/lib/modules/$KERNEL_VERSION/extra/nvidia"
+    )
+
+    for search_path in "${NVIDIA_SEARCH_PATHS[@]}"; do
+        if [ -d "$search_path" ]; then
+            echo "Found NVIDIA modules in: $search_path"
+            for ko_file in $(find "$search_path" -name "*.ko" 2>/dev/null); do
+                echo "Signing NVIDIA module: $(basename $ko_file)"
+                if [ -f "$KERNEL_SRC_DIR/scripts/sign-file" ]; then
+                    $KERNEL_SRC_DIR/scripts/sign-file sha256 \
+                        /etc/pki/module-signing/module-signing.key \
+                        /etc/pki/module-signing/module-signing.crt \
+                        "$ko_file"
+                    NVIDIA_MODULES_FOUND=true
+                fi
+            done
+        fi
+    done
+
+    # Also check for NVIDIA modules in standard kernel locations
+    for ko_file in $(find /lib/modules/$KERNEL_VERSION -name "nvidia.ko" 2>/dev/null); do
+        echo "Signing NVIDIA module: $(basename $ko_file)"
+        if [ -f "$KERNEL_SRC_DIR/scripts/sign-file" ]; then
+            $KERNEL_SRC_DIR/scripts/sign-file sha256 \
+                /etc/pki/module-signing/module-signing.key \
+                /etc/pki/module-signing/module-signing.crt \
+                "$ko_file"
+            NVIDIA_MODULES_FOUND=true
+        fi
+    done
+
+    if [ "$NVIDIA_MODULES_FOUND" = true ]; then
+        echo "✓ NVIDIA modules signed successfully"
+        # Update module dependencies after signing
+        depmod -a "$KERNEL_VERSION"
+    else
+        echo "⚠️  No NVIDIA modules found to sign. They may be built on first boot."
+    fi
 else
-    echo "⚠️  No NVIDIA modules found to sign. They may be built on first boot."
+    if [ "$NVIDIA_BASE" = true ]; then
+        echo "✓ Skipping NVIDIA module building (using NVIDIA base image)"
+    else
+        echo "⚠️  Skipping NVIDIA module building (installation failed)"
+    fi
 fi
 
 # Install Rust
@@ -299,9 +335,7 @@ echo "✓ Firefox removed (if present)"
 echo "Installing Visual Studio Code..."
 rpm --import https://packages.microsoft.com/keys/microsoft.asc
 
-catαιο
-
-System: > /etc/yum.repos.d/vscode.repo << 'EOF'
+cat > /etc/yum.repos.d/vscode.repo << 'EOF'
 [code]
 name=Visual Studio Code
 baseurl=https://packages.microsoft.com/yumrepos/vscode
@@ -466,7 +500,23 @@ EOF
 
 echo "ujust recipes created successfully!"
 
+# Final Build Summary
+#####################
+
 echo "Build completed successfully!"
+echo ""
+echo "BUILD SUMMARY:"
+echo "=============="
+echo "Base Image: ${BASE_IMAGE:-unknown}"
+if [ "$NVIDIA_BASE" = true ]; then
+    echo "NVIDIA: ✓ Using NVIDIA base image (drivers pre-installed)"
+else
+    if [ "$NVIDIA_INSTALLED" = true ]; then
+        echo "NVIDIA: ✓ Drivers installed via akmods"
+    else
+        echo "NVIDIA: ⚠️  Driver installation failed or skipped"
+    fi
+fi
 echo ""
 echo "IMPORTANT NOTES:"
 echo "==============="
@@ -488,19 +538,29 @@ echo ""
 echo "4. Test module loading:"
 echo "   ujust test-hp-wmi-module"
 echo ""
-echo "5. If NVIDIA modules aren't working:"
-echo "   ujust rebuild-nvidia"
-echo ""
+if [ "$NVIDIA_INSTALLED" = true ]; then
+    echo "5. If NVIDIA modules aren't working:"
+    echo "   ujust rebuild-nvidia"
+    echo ""
+fi
 echo "6. For complete help:"
 echo "   ujust help-hp-wmi-mok"
 echo ""
 echo "7. Software installed:"
 echo "   ✓ HP-WMI custom module (signed)"
-echo "   ✓ NVIDIA drivers with akmods (signed)"
+if [ "$NVIDIA_BASE" = true ]; then
+    echo "   ✓ NVIDIA drivers (pre-installed in base image)"
+elif [ "$NVIDIA_INSTALLED" = true ]; then
+    echo "   ✓ NVIDIA drivers with akmods (signed)"
+else
+    echo "   ⚠️  NVIDIA drivers (installation failed)"
+fi
 echo "   ✓ Rust programming language"
 echo "   ✓ Brave browser (Firefox removed)"
 echo "   ✓ Visual Studio Code"
-echo "   ✓ CUDA development tools"
+if [ "$NVIDIA_INSTALLED" = true ] || [ "$NVIDIA_BASE" = true ]; then
+    echo "   ✓ CUDA development tools"
+fi
 echo ""
 if [ "$USING_PERSISTENT_KEYS" = false ]; then
     echo "⚠️  IMPORTANT: Consider setting up persistent key management"
