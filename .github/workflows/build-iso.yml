@@ -1,5 +1,6 @@
 ---
-name: Build ISOs
+name: Bazzite-Omen ISO Build
+# This workflow builds the Bazzite-Omen ISO images using the bootc-image-builder action.
 
 on:
   workflow_dispatch:

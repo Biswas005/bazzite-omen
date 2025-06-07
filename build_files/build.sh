@@ -80,6 +80,28 @@ echo "hp-wmi module replacement completed successfully!"
 # Install other packages you need
 dnf5 install -y tmux
 
+### Install Visual Studio Code
+echo "Installing Visual Studio Code..."
+# Import Microsoft GPG key
+rpm --import https://packages.microsoft.com/keys/microsoft.asc
+
+# Add VS Code repository
+cat > /etc/yum.repos.d/vscode.repo << 'EOF'
+[code]
+name=Visual Studio Code
+baseurl=https://packages.microsoft.com/yumrepos/vscode
+enabled=1
+autorefresh=1
+type=rpm-md
+gpgcheck=1
+gpgkey=https://packages.microsoft.com/keys/microsoft.asc
+EOF
+
+# Install VS Code using dnf5
+dnf5 install -y code
+
+echo "Visual Studio Code installed successfully!"
+
 
 # Enable services
 systemctl enable podman.socket
