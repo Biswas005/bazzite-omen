@@ -3,7 +3,7 @@ export image_name := env("IMAGE_NAME", "yourimage")
 export centos_version := env("CENTOS_VERSION", "stream10")
 export fedora_version := env("CENTOS_VERSION", "41")
 export default_tag := env("DEFAULT_TAG", "latest")
-export bib_image := env("BIB_IMAGE", "quay.io/centos-bootc/bootc-image-builder:latest")
+export bib_image := env("BIB_IMAGE", "quay.io/ublue-os/bootc-image-builder:bazzite-42")
 
 alias build-vm := build-qcow2
 alias rebuild-vm := rebuild-qcow2
