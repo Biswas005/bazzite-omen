@@ -26,7 +26,8 @@ if [ ! -f "/etc/pki/module-signing/module-signing.key" ]; then
     mkdir -p /etc/pki/module-signing/
     cd /etc/pki/module-signing/
     
-    openssl genpkey -algorithm RSA -out module-signing.key -pkcs8 -pkeyopt rsa_keygen_bits:2048
+    # Fixed OpenSSL command - removed invalid -pkcs8 flag
+    openssl genpkey -algorithm RSA -out module-signing.key -pkeyopt rsa_keygen_bits:2048
     openssl req -new -x509 -key module-signing.key -out module-signing.crt -days 3650 \
         -subj "/CN=Bazzite Omen Module Signer/"
     chmod 600 module-signing.key
