@@ -58,35 +58,42 @@ fi
 
 # Function to setup persistent keys from GitHub Secrets and local certificates
 setup_github_secrets_keys() {
-    echo "Setting up persistent keys from GitHub Secrets and local certificates..."
+    echo "Setting up persistent keys from GitHub Secrets..."
 
-    mkdir -p /etc/pki/module-signing/  
+    mkdir -p /etc/pki/module-signing/
 
-    # Decode the private key from GitHub Secrets environment variable
-    if [ -n "${BAZZITE_MODULE_SIGNING_KEY:-}" ]; then  
-        echo "$BAZZITE_MODULE_SIGNING_KEY" | base64 -d > /etc/pki/module-signing/module-signing.key  
-
-        # Copy certificate and DER files from /ctx/build_files/ (same directory as hp-wmi.c)
-        if [ -f "module-signing.crt" ] && [ -f "module-signing.der" ]; then
-            cp module-signing.crt /etc/pki/module-signing/module-signing.crt
-            cp module-signing.der /etc/pki/module-signing/module-signing.der
-
-            # Set proper permissions
-            chmod 600 /etc/pki/module-signing/module-signing.key  
-            chmod 644 /etc/pki/module-signing/module-signing.crt  
-            chmod 644 /etc/pki/module-signing/module-signing.der  
-
-            echo "✓ Persistent keys loaded: key from GitHub Secrets, certificates from build directory"
-            return 0  
-        else
-            echo "ERROR: Certificate files (module-signing.crt or module-signing.der) not found in build directory"
-            return 1
-        fi
-    else  
-        echo "GitHub Secrets not found - will generate new keys"  
-        return 1  
+    # Decode and write the private key
+    if [ -n "${BAZZITE_MODULE_SIGNING_KEY:-}" ]; then
+        echo "$BAZZITE_MODULE_SIGNING_KEY" | base64 -d > /etc/pki/module-signing/module-signing.key
+        chmod 600 /etc/pki/module-signing/module-signing.key
+    else
+        echo "ERROR: BAZZITE_MODULE_SIGNING_KEY not set."
+        return 1
     fi
+
+    # Decode and write the certificate
+    if [ -n "${BAZZITE_MODULE_SIGNING_CRT:-}" ]; then
+        echo "$BAZZITE_MODULE_SIGNING_CRT" | base64 -d > /etc/pki/module-signing/module-signing.crt
+        chmod 644 /etc/pki/module-signing/module-signing.crt
+    else
+        echo "ERROR: BAZZITE_MODULE_SIGNING_CRT not set."
+        return 1
+    fi
+
+    # Decode and write the DER certificate
+    if [ -n "${BAZZITE_MODULE_SIGNING_DER:-}" ]; then
+        echo "$BAZZITE_MODULE_SIGNING_DER" | base64 -d > /etc/pki/module-signing/module-signing.der
+        chmod 644 /etc/pki/module-signing/module-signing.der
+    else
+        echo "ERROR: BAZZITE_MODULE_SIGNING_DER not set."
+        return 1
+    fi
+
+    echo "✓ All persistent keys and certificates loaded from GitHub Secrets"
+    return 0
 }
+
+    
 
 # Install base packages (always needed)
 echo "Installing build dependencies..."
