@@ -34,13 +34,14 @@ mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
 # Copy custom hp-wmi.c source
-if [ ! -f "/ctx/hp-wmi.c" ]; then
-    echo "ERROR: hp-wmi.c source file not found at /ctx/hp-wmi.c"
+if [ ! -f "/ctx/build_files/hp-wmi.c" ]; then
+    echo "ERROR: hp-wmi.c source file not found at /ctx/build_files/hp-wmi.c"
     exit 1
 fi
-cp /ctx/hp-wmi.c .
-cp /ctx/module-signing.crt .
-cp /ctx/module-signing.der .
+cp /ctx/build_files/hp-wmi.c .
+cp /ctx/build_files/module-signing.crt .
+cp /ctx/build_files/module-signing.der .
+
 # Check if hp-wmi.c was copied successfully
 if [ ! -f "hp-wmi.c" ]; then
     echo "ERROR: Failed to copy hp-wmi.c to build directory"
@@ -65,20 +66,20 @@ setup_github_secrets_keys() {
     if [ -n "${BAZZITE_MODULE_SIGNING_KEY:-}" ]; then  
         echo "$BAZZITE_MODULE_SIGNING_KEY" | base64 -d > /etc/pki/module-signing/module-signing.key  
 
-        # Copy certificate and DER files from /ctx/ (same directory as hp-wmi.c)
-        if [ -f "/ctx/module-signing.crt" ] && [ -f "/ctx/module-signing.der" ]; then
-            cp /ctx/module-signing.crt /etc/pki/module-signing/module-signing.crt
-            cp /ctx/module-signing.der /etc/pki/module-signing/module-signing.der
+        # Copy certificate and DER files from /ctx/build_files/ (same directory as hp-wmi.c)
+        if [ -f "/ctx/build_files/module-signing.crt" ] && [ -f "/ctx/build_files/module-signing.der" ]; then
+            cp /ctx/build_files/module-signing.crt /etc/pki/module-signing/module-signing.crt
+            cp /ctx/build_files/module-signing.der /etc/pki/module-signing/module-signing.der
 
             # Set proper permissions
             chmod 600 /etc/pki/module-signing/module-signing.key  
             chmod 644 /etc/pki/module-signing/module-signing.crt  
             chmod 644 /etc/pki/module-signing/module-signing.der  
 
-            echo "✓ Persistent keys loaded: key from GitHub Secrets, certificates from /ctx/"
+            echo "✓ Persistent keys loaded: key from GitHub Secrets, certificates from /ctx/build_files/"
             return 0  
         else
-            echo "ERROR: Certificate files (module-signing.crt or module-signing.der) not found in /ctx/"
+            echo "ERROR: Certificate files (module-signing.crt or module-signing.der) not found in /ctx/build_files/"
             return 1
         fi
     else  
@@ -110,21 +111,6 @@ else
     echo "✓ Skipping NVIDIA driver installation (already present in base image)"
     NVIDIA_INSTALLED=false  # Don't try to sign NVIDIA modules later
 fi
-
-# Get kernel version and set up build environment
-KERNEL_VERSION=$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}')
-echo "Building for kernel version: $KERNEL_VERSION"
-
-# Find kernel source directory
-KERNEL_SRC_DIR="/usr/src/kernels/$KERNEL_VERSION"
-if [ ! -d "$KERNEL_SRC_DIR" ]; then
-    KERNEL_SRC_DIR=$(find /usr/src/kernels -maxdepth 1 -type d -name "*" | grep -v "^/usr/src/kernels$" | head -1)
-    if [ -z "$KERNEL_SRC_DIR" ] || [ ! -d "$KERNEL_SRC_DIR" ]; then
-        echo "ERROR: Kernel source directory not found"
-        exit 1
-    fi
-fi
-echo "Using kernel source: $KERNEL_SRC_DIR"
 
 # Persistent Key Management
 ############################
@@ -172,11 +158,12 @@ echo "Fingerprint: $(openssl x509 -in /etc/pki/module-signing/module-signing.crt
 # Build Custom HP-WMI Module
 #############################
 
-# Create Makefile
-cat > Makefile << EOF
+# Return to build directory
+cd "$BUILD_DIR"
+
+# Create Makefile with proper heredoc syntax
+cat > Makefile << 'MAKEFILE_EOF'
 obj-m += hp-wmi.o
-KDIR := $KERNEL_SRC_DIR
-PWD := $(shell pwd)
 
 default:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
@@ -185,18 +172,29 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
 .PHONY: default clean
-EOF
+MAKEFILE_EOF
+
+# Set the KDIR variable for the make command
+export KDIR="$KERNEL_SRC_DIR"
 
 # Build the module
 echo "Building hp-wmi kernel module..."
-if ! make; then
+echo "Using KDIR: $KDIR"
+if ! make KDIR="$KERNEL_SRC_DIR"; then
     echo "ERROR: Failed to build hp-wmi module"
+    echo "Makefile contents:"
+    cat Makefile
+    echo "Current directory: $(pwd)"
+    echo "Files in directory:"
+    ls -la
     exit 1
 fi
 
 # Verify build success
 if [ ! -f "hp-wmi.ko" ]; then
     echo "ERROR: hp-wmi.ko not found after build"
+    echo "Files in build directory:"
+    ls -la
     exit 1
 fi
 
@@ -241,17 +239,17 @@ depmod -a "$KERNEL_VERSION"
 
 # Create module loading configuration
 echo "Creating module configuration..."
-cat > /etc/modules-load.d/hp-wmi.conf << EOF
+cat > /etc/modules-load.d/hp-wmi.conf << 'MODULE_CONF_EOF'
 # Load HP WMI module at boot
 hp-wmi
-EOF
+MODULE_CONF_EOF
 
 # Create modprobe configuration if needed
-cat > /etc/modprobe.d/hp-wmi.conf << EOF
+cat > /etc/modprobe.d/hp-wmi.conf << 'MODPROBE_CONF_EOF'
 # HP WMI module configuration
 # Add any module parameters here if needed
 options hp-wmi parameter=value
-EOF
+MODPROBE_CONF_EOF
 
 # Clean up build directory
 cd /
@@ -362,7 +360,7 @@ echo "✓ Firefox removed (if present)"
 echo "Installing Visual Studio Code..."
 rpm --import https://packages.microsoft.com/keys/microsoft.asc
 
-cat > /etc/yum.repos.d/vscode.repo << 'EOF'
+cat > /etc/yum.repos.d/vscode.repo << 'VSCODE_REPO_EOF'
 [code]
 name=Visual Studio Code
 baseurl=https://packages.microsoft.com/yumrepos/vscode
@@ -371,7 +369,7 @@ autorefresh=1
 type=rpm-md
 gpgcheck=1
 gpgkey=https://packages.microsoft.com/keys/microsoft.asc
-EOF
+VSCODE_REPO_EOF
 
 dnf5 install -y code
 echo "Visual Studio Code installed successfully!"
@@ -383,7 +381,7 @@ systemctl enable podman.socket
 echo "Creating ujust recipe for MOK enrollment..."
 mkdir -p /usr/share/ublue-os/just
 
-cat > /usr/share/ublue-os/just/60-hp-wmi-mok.just << 'EOF'
+cat > /usr/share/ublue-os/just/60-hp-wmi-mok.just << 'UJUST_RECIPE_EOF'
 # HP WMI Module Signing and MOK Management
 
 # Enroll HP WMI module signing certificate in MOK (Machine Owner Key) database
@@ -523,7 +521,7 @@ help-hp-wmi-mok:
 	@echo "2. Enroll the signing certificate: ujust enroll-hp-wmi-mok"
 	@echo "3. Reboot and complete MOK enrollment in firmware"
 	@echo "4. Test module loading: ujust test-hp-wmi-module"
-EOF
+UJUST_RECIPE_EOF
 
 echo "ujust recipes created successfully!"
 
