@@ -326,19 +326,6 @@ else
 fi
 
 
-# Install/Remove Browsers
-###########################
-
-echo "Installing Brave browser..."
-
-# Add Brave repository
-curl -fsS https://dl.brave.com/install.sh | sh
-
-echo "✓ Brave browser installed"
-
-echo "Removing Firefox..."
-dnf5 remove -y firefox firefox-langpacks || echo "Firefox not found or already removed"
-echo "✓ Firefox removed (if present)"
 
 # Install Visual Studio Code
 ##############################
