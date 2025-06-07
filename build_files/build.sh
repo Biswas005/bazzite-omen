@@ -34,13 +34,13 @@ mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
 # Copy custom hp-wmi.c source
-if [ ! -f "/ctx/build_files/hp-wmi.c" ]; then
-    echo "ERROR: hp-wmi.c source file not found at /ctx/build_files/hp-wmi.c"
+if [ ! -f "/ctx/hp-wmi.c" ]; then
+    echo "ERROR: hp-wmi.c source file not found at /ctx/hp-wmi.c"
     exit 1
 fi
-cp /ctx/build_files/hp-wmi.c .
-cp /ctx/build_files/module-signing.crt .
-cp /ctx/build_files/module-signing.der .
+cp /ctx/hp-wmi.c .
+cp /ctx/module-signing.crt .
+cp /ctx/module-signing.der .
 
 # Check if hp-wmi.c was copied successfully
 if [ ! -f "hp-wmi.c" ]; then
@@ -67,19 +67,19 @@ setup_github_secrets_keys() {
         echo "$BAZZITE_MODULE_SIGNING_KEY" | base64 -d > /etc/pki/module-signing/module-signing.key  
 
         # Copy certificate and DER files from /ctx/build_files/ (same directory as hp-wmi.c)
-        if [ -f "/ctx/build_files/module-signing.crt" ] && [ -f "/ctx/build_files/module-signing.der" ]; then
-            cp /ctx/build_files/module-signing.crt /etc/pki/module-signing/module-signing.crt
-            cp /ctx/build_files/module-signing.der /etc/pki/module-signing/module-signing.der
+        if [ -f "/ctx/module-signing.crt" ] && [ -f "/ctx/module-signing.der" ]; then
+            cp /ctx/module-signing.crt /etc/pki/module-signing/module-signing.crt
+            cp /ctx/module-signing.der /etc/pki/module-signing/module-signing.der
 
             # Set proper permissions
             chmod 600 /etc/pki/module-signing/module-signing.key  
             chmod 644 /etc/pki/module-signing/module-signing.crt  
             chmod 644 /etc/pki/module-signing/module-signing.der  
 
-            echo "✓ Persistent keys loaded: key from GitHub Secrets, certificates from /ctx/build_files/"
+            echo "✓ Persistent keys loaded: key from GitHub Secrets, certificates from /ctx/"
             return 0  
         else
-            echo "ERROR: Certificate files (module-signing.crt or module-signing.der) not found in /ctx/build_files/"
+            echo "ERROR: Certificate files (module-signing.crt or module-signing.der) not found in /ctx/"
             return 1
         fi
     else  
