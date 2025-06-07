@@ -1,22 +1,45 @@
+name = "bazzite-omen-installer"
+description = "Fedora 41 installer that switches to Bazzite Omen container image"
+version = "1.0.0"
+modules = []
+groups = []
+
+[[packages]]
+name = "bootc"
+version = "*"
+
+[[packages]]
+name = "ostree"
+version = "*"
+
+[customizations]
 distro = "fedora-41"
+
+[customizations.installer]
+unattended = false
 
 [customizations.installer.kickstart]
 contents = """
-%post
+%post --log=/root/bootc-switch.log
+# Ensure bootc is available
+dnf install -y bootc ostree
+
+# Switch to the Bazzite Omen container image
 bootc switch --mutate-in-place --transport registry ghcr.io/biswas005/bazzite-omen:latest
+
+# Log the completion
+echo "Bootc switch completed at $(date)" >> /root/bootc-switch.log
 %end
 """
 
 [customizations.installer.modules]
 enable = [
-  "org.fedoraproject.Anaconda.Modules.Storage",
-  "org.fedoraproject.Anaconda.Modules.Network",
-  "org.fedoraproject.Anaconda.Modules.Security",
-  "org.fedoraproject.Anaconda.Modules.Services",
-  "org.fedoraproject.Anaconda.Modules.Users",
-  "org.fedoraproject.Anaconda.Modules.Subscription",
-  "org.fedoraproject.Anaconda.Modules.Timezone" 
+    "org.fedoraproject.Anaconda.Modules.Storage",
+    "org.fedoraproject.Anaconda.Modules.Network", 
+    "org.fedoraproject.Anaconda.Modules.Security",
+    "org.fedoraproject.Anaconda.Modules.Services",
+    "org.fedoraproject.Anaconda.Modules.Users",
+    "org.fedoraproject.Anaconda.Modules.Subscription",
+    "org.fedoraproject.Anaconda.Modules.Timezone"
 ]
-disable = [
-  
-]
+disable = []
