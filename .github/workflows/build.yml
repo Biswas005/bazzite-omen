@@ -18,11 +18,6 @@ env:
   IMAGE_DESC: "My Customized Universal Blue Image"
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"  # do not edit
   ARTIFACTHUB_LOGO_URL: "https://avatars.githubusercontent.com/u/120078124?s=200&v=4"  # You should put your own image here so that you get a fancy profile image on https://artifacthub.io/!
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ matrix.image-flavor.name }}
-  cancel-in-progress: true
-
 jobs:
   build_push:
     name: Build and push image
@@ -37,6 +32,9 @@ jobs:
           - name: "nvidia"
             base: "ghcr.io/ublue-os/bazzite-deck-nvidia:latest"
             suffix: "-nvidia"
+  concurrency:
+            group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ matrix.image-flavor.name }}
+            cancel-in-progress: true
 
     permissions:
       contents: read
