@@ -26,12 +26,21 @@ if [ ! -f "/etc/pki/module-signing/module-signing.key" ]; then
     mkdir -p /etc/pki/module-signing/
     cd /etc/pki/module-signing/
     
-    # Fixed OpenSSL command - removed invalid -pkcs8 flag
+    # Generate RSA private key
     openssl genpkey -algorithm RSA -out module-signing.key -pkeyopt rsa_keygen_bits:2048
+    
+    # Generate X.509 certificate
     openssl req -new -x509 -key module-signing.key -out module-signing.crt -days 3650 \
         -subj "/CN=Bazzite Omen Module Signer/"
+    
+    # Convert certificate to DER format for MOK enrollment
+    openssl x509 -in module-signing.crt -outform DER -out module-signing.der
+    
+    # Set proper permissions
     chmod 600 module-signing.key
-    chmod 644 module-signing.crt
+    chmod 644 module-signing.crt module-signing.der
+    
+    echo "Generated signing keys in PEM and DER formats"
 fi
 
 # Create build directory
@@ -158,16 +167,173 @@ echo "Visual Studio Code installed successfully!"
 # Enable services
 systemctl enable podman.socket
 
+# Create ujust recipe for MOK enrollment
+echo "Creating ujust recipe for MOK enrollment..."
+mkdir -p /usr/share/ublue-os/just
+
+cat > /usr/share/ublue-os/just/60-hp-wmi-mok.just << 'EOF'
+# HP WMI Module Signing and MOK Management
+
+# Enroll HP WMI module signing certificate in MOK (Machine Owner Key) database
+enroll-hp-wmi-mok:
+    #!/usr/bin/bash
+    set -euo pipefail
+    
+    MOK_KEY="/etc/pki/module-signing/module-signing.der"
+    
+    if [ ! -f "$MOK_KEY" ]; then
+        echo "ERROR: MOK certificate not found at $MOK_KEY"
+        echo "Please ensure the hp-wmi module build script has been run first."
+        exit 1
+    fi
+    
+    echo "Enrolling HP WMI module signing certificate in MOK database..."
+    echo "You will be prompted to set a password for MOK enrollment."
+    echo "Remember this password - you'll need it during the next boot."
+    echo ""
+    
+    if sudo mokutil --import "$MOK_KEY"; then
+        echo ""
+        echo "SUCCESS: Certificate enrolled in MOK database."
+        echo ""
+        echo "NEXT STEPS:"
+        echo "1. Reboot your system: sudo systemctl reboot"
+        echo "2. During boot, you'll see a blue MOK Manager screen"
+        echo "3. Select 'Enroll MOK' -> 'Continue' -> 'Yes'"
+        echo "4. Enter the password you just set"
+        echo "5. Select 'Reboot'"
+        echo ""
+        echo "After reboot, your custom hp-wmi module will load without issues."
+    else
+        echo "ERROR: Failed to enroll certificate"
+        exit 1
+    fi
+
+# Check MOK enrollment status
+check-hp-wmi-mok:
+    #!/usr/bin/bash
+    set -euo pipefail
+    
+    echo "Checking MOK database for HP WMI certificate..."
+    
+    if mokutil --list-enrolled | grep -q "Bazzite Omen Module Signer"; then
+        echo "✓ HP WMI module signing certificate is enrolled in MOK database"
+    else
+        echo "✗ HP WMI module signing certificate is NOT enrolled in MOK database"
+        echo "Run 'ujust enroll-hp-wmi-mok' to enroll it"
+    fi
+    
+    echo ""
+    echo "Secure Boot status:"
+    if mokutil --sb-state | grep -q "SecureBoot enabled"; then
+        echo "✓ Secure Boot is enabled"
+    else
+        echo "✗ Secure Boot is disabled"
+    fi
+
+# Remove HP WMI certificate from MOK database
+remove-hp-wmi-mok:
+    #!/usr/bin/bash
+    set -euo pipefail
+    
+    MOK_KEY="/etc/pki/module-signing/module-signing.der"
+    
+    if [ ! -f "$MOK_KEY" ]; then
+        echo "ERROR: MOK certificate not found at $MOK_KEY"
+        exit 1
+    fi
+    
+    echo "Removing HP WMI module signing certificate from MOK database..."
+    echo "You will be prompted to set a password for MOK removal."
+    echo ""
+    
+    if sudo mokutil --delete "$MOK_KEY"; then
+        echo ""
+        echo "SUCCESS: Certificate removal request submitted."
+        echo "Reboot and follow the MOK Manager prompts to complete removal."
+    else
+        echo "ERROR: Failed to request certificate removal"
+        exit 1
+    fi
+
+# Test HP WMI module loading
+test-hp-wmi-module:
+    #!/usr/bin/bash
+    set -euo pipefail
+    
+    echo "Testing HP WMI module..."
+    
+    # Remove module if already loaded
+    if lsmod | grep -q hp_wmi; then
+        echo "Unloading existing hp-wmi module..."
+        sudo modprobe -r hp-wmi || true
+    fi
+    
+    # Try to load the module
+    echo "Loading hp-wmi module..."
+    if sudo modprobe hp-wmi; then
+        echo "✓ hp-wmi module loaded successfully"
+        
+        # Check if module is actually loaded
+        if lsmod | grep -q hp_wmi; then
+            echo "✓ hp-wmi module is active"
+            
+            # Show module info
+            echo ""
+            echo "Module information:"
+            modinfo hp-wmi | head -10
+        else
+            echo "✗ hp-wmi module failed to stay loaded"
+        fi
+    else
+        echo "✗ Failed to load hp-wmi module"
+        echo ""
+        echo "This might be due to:"
+        echo "1. Secure Boot is enabled but certificate is not enrolled in MOK"
+        echo "2. Module signature verification failed"
+        echo "3. Module compatibility issues"
+        echo ""
+        echo "Check dmesg for more details: dmesg | tail -20"
+    fi
+
+# Show help for HP WMI MOK management
+help-hp-wmi-mok:
+    @echo "HP WMI Module MOK (Machine Owner Key) Management Commands:"
+    @echo ""
+    @echo "ujust enroll-hp-wmi-mok    - Enroll signing certificate in MOK database"
+    @echo "ujust check-hp-wmi-mok     - Check MOK enrollment status"
+    @echo "ujust remove-hp-wmi-mok    - Remove certificate from MOK database"
+    @echo "ujust test-hp-wmi-module   - Test loading the hp-wmi module"
+    @echo "ujust help-hp-wmi-mok      - Show this help message"
+    @echo ""
+    @echo "Typical workflow:"
+    @echo "1. Build and install the custom hp-wmi module (build script)"
+    @echo "2. Enroll the signing certificate: ujust enroll-hp-wmi-mok"
+    @echo "3. Reboot and complete MOK enrollment in firmware"
+    @echo "4. Test module loading: ujust test-hp-wmi-module"
+EOF
+
+echo "ujust recipes created successfully!"
+
 echo "Build completed successfully!"
 echo ""
 echo "IMPORTANT NOTES:"
 echo "==============="
-echo "1. If Secure Boot is enabled, you'll need to import the signing certificate:"
-echo "   sudo mokutil --import /etc/pki/module-signing/module-signing.crt"
+echo "1. Module signing keys have been generated in both PEM and DER formats:"
+echo "   - /etc/pki/module-signing/module-signing.crt (PEM)"
+echo "   - /etc/pki/module-signing/module-signing.der (DER)"
+echo ""
+echo "2. If Secure Boot is enabled, enroll the signing certificate using:"
+echo "   ujust enroll-hp-wmi-mok"
 echo "   Then reboot and follow the MOK enrollment process."
 echo ""
-echo "2. Alternatively, disable Secure Boot in BIOS/UEFI settings."
+echo "3. Check MOK enrollment status with:"
+echo "   ujust check-hp-wmi-mok"
 echo ""
-echo "3. After installation, verify the module loads correctly:"
-echo "   sudo modprobe hp-wmi"
-echo "   lsmod | grep hp_wmi"
+echo "4. Test module loading with:"
+echo "   ujust test-hp-wmi-module"
+echo ""
+echo "5. For help with MOK management:"
+echo "   ujust help-hp-wmi-mok"
+echo ""
+echo "6. Alternatively, disable Secure Boot in BIOS/UEFI settings."
