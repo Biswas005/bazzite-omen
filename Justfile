@@ -1,14 +1,11 @@
-# Bazzite-specific environment variables
-export repo_organization := env("GITHUB_REPOSITORY_OWNER", "yourname")
-export image_name := env("IMAGE_NAME", "bazzite-omen")  # Changed from "yourimage"
-export fedora_version := env("FEDORA_VERSION", "41")     # Bazzite uses Fedora, not CentOS
+# Bazzite NVIDIA environment variables
+export repo_organization := env("GITHUB_REPOSITORY_OWNER", "Biswas005")
+export image_name := env("IMAGE_NAME", "bazzite-omen")
+export fedora_version := env("FEDORA_VERSION", "41")
 export default_tag := env("DEFAULT_TAG", "latest")
 export bib_image := env("BIB_IMAGE", "quay.io/ublue-os/bootc-image-builder:latest")
 
-# Bazzite base images to choose from:
-# - ghcr.io/ublue-os/bazzite (standard Bazzite)
-# - ghcr.io/ublue-os/bazzite-nvidia (Bazzite with NVIDIA drivers)
-# - ghcr.io/ublue-os/bazzite-deck (Steam Deck specific)
+# Using Bazzite NVIDIA as the standard base image
 export base_image := env("BASE_IMAGE", "ghcr.io/ublue-os/bazzite-nvidia")
 
 alias build-vm := build-qcow2
@@ -77,37 +74,27 @@ sudoif command *args:
     }
     sudoif {{ command }} {{ args }}
 
-# Build Bazzite-based image with HP Omen customizations
+# Build Bazzite NVIDIA image with HP Omen customizations
 #
 # Arguments:
 #   $target_image - The tag you want to apply to the image (default: bazzite-omen).
 #   $tag - The tag for the image (default: latest).
-#   $nvidia - Use NVIDIA base image (default: "1" for HP Omen gaming laptops).
-#   $deck - Use Steam Deck optimizations (default: "0").
 #
 # The script constructs the version string using the tag and the current date.
 # If the git working directory is clean, it also includes the short SHA of the current HEAD.
 #
 # Example usage:
-#   just build bazzite-omen latest 1 0
+#   just build bazzite-omen latest
 #
 # This will build a 'bazzite-omen:latest' image with NVIDIA support for HP Omen laptops.
 
-# Build the Bazzite-based image with HP Omen customizations
-build $target_image=image_name $tag=default_tag $nvidia="1" $deck="0":
+# Build the Bazzite NVIDIA image with HP Omen customizations
+[group('Build')]
+build $target_image=image_name $tag=default_tag:
     #!/usr/bin/env bash
 
-    # Determine base image based on options
-    if [[ "${deck}" == "1" ]]; then
-        BASE_IMG="ghcr.io/ublue-os/bazzite-deck"
-        echo "Using Steam Deck base image"
-    elif [[ "${nvidia}" == "1" ]]; then
-        BASE_IMG="ghcr.io/ublue-os/bazzite-nvidia"
-        echo "Using NVIDIA base image for gaming laptops"
-    else
-        BASE_IMG="ghcr.io/ublue-os/bazzite"
-        echo "Using standard Bazzite base image"
-    fi
+    BASE_IMG="ghcr.io/ublue-os/bazzite-nvidia"
+    echo "Building Bazzite NVIDIA image for HP Omen laptops"
 
     # Get Version
     ver="${tag}-${fedora_version}.$(date +%Y%m%d)"
@@ -128,17 +115,7 @@ build $target_image=image_name $tag=default_tag $nvidia="1" $deck="0":
         --tag "${target_image}:${tag}" \
         .
 
-# Build specifically for HP Omen laptops (with NVIDIA)
-[group('Build')]
-build-omen $target_image=("bazzite-omen") $tag=default_tag: 
-    just build {{target_image}} {{tag}} 1 0
-
-# Build for Steam Deck (if you want to test on Deck)
-[group('Build')]
-build-deck $target_image=("bazzite-omen-deck") $tag=default_tag:
-    just build {{target_image}} {{tag}} 0 1
-
-# Command: _rootful_load_image (same as original)
+# Command: _rootful_load_image
 _rootful_load_image $target_image=image_name $tag=default_tag:
     #!/usr/bin/bash
     set -eoux pipefail
