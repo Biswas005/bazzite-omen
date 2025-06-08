@@ -5,15 +5,22 @@ COPY build_files /
 # Base Image
 FROM ghcr.io/ublue-os/bazzite-nvidia:latest
 
-# Use BuildKit secrets to mount keys during build
+# Build arguments for module signing secrets
+ARG module_signing_key
+ARG module_signing_crt  
+ARG module_signing_der
+
+# Create temporary directory for secrets and decode them
 RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=cache,dst=/var/cache \
     --mount=type=cache,dst=/var/log \
     --mount=type=tmpfs,dst=/tmp \
-    --mount=type=secret,id=module_signing_key,target=/run/secrets/module-signing.key.b64 \
-    --mount=type=secret,id=module_signing_crt,target=/run/secrets/module-signing.crt.b64 \
-    --mount=type=secret,id=module_signing_der,target=/run/secrets/module-signing.der.b64 \
+    mkdir -p /tmp/secrets && \
+    echo "$module_signing_key" | base64 -d > /tmp/secrets/module-signing.key && \
+    echo "$module_signing_crt" | base64 -d > /tmp/secrets/module-signing.crt && \
+    echo "$module_signing_der" | base64 -d > /tmp/secrets/module-signing.der && \
     /ctx/build.sh && \
+    rm -rf /tmp/secrets && \
     ostree container commit
 
 RUN bootc container lint

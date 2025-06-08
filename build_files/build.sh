@@ -40,25 +40,27 @@ for file in hp-wmi.c; do
     cp "/ctx/$file" .
 done
 
-# Copy secret base64 files from /run/secrets
-for file in module-signing.key.b64 module-signing.crt.b64 module-signing.der.b64; do
-    if [ ! -f "/run/secrets/$file" ]; then
-        echo "❌ ERROR: Secret file '/run/secrets/$file' not found!"
-        exit 1
-    fi
-    cp "/run/secrets/$file" .
-done
-
-echo "✅ Copied source and secret base64 files into build directory"
-
-# Decode secrets
-base64 -d module-signing.key.b64 > module-signing.key
-base64 -d module-signing.crt.b64 > module-signing.crt
-base64 -d module-signing.der.b64 > module-signing.der
-
-chmod 600 module-signing.key
-
-echo "✅ Decoded module signing secrets successfully."
+# Look for secrets in /tmp/secrets (created by Dockerfile)
+SECRET_PATH="/tmp/secrets"
+if [ -f "$SECRET_PATH/module-signing.key" ] && \
+   [ -f "$SECRET_PATH/module-signing.crt" ] && \
+   [ -f "$SECRET_PATH/module-signing.der" ]; then
+    
+    echo "✅ Found decoded secrets in $SECRET_PATH"
+    
+    # Copy the already decoded files
+    cp "$SECRET_PATH/module-signing.key" .
+    cp "$SECRET_PATH/module-signing.crt" .
+    cp "$SECRET_PATH/module-signing.der" .
+    
+    chmod 600 module-signing.key
+    
+    echo "✅ Copied decoded module signing secrets successfully."
+else
+    echo "❌ ERROR: Module signing secrets not found in $SECRET_PATH!"
+    ls -la "$SECRET_PATH/" 2>/dev/null || echo "Directory doesn't exist"
+    exit 1
+fi
 
 # Create target dir and copy decoded files
 mkdir -p /etc/pki/module-signing/
@@ -72,17 +74,29 @@ chmod 644 /etc/pki/module-signing/module-signing.der
 
 echo "✅ Copied decoded keys and certs to /etc/pki/module-signing/"
 
-
 # --- Persistent Key Setup ---
 setup_github_secrets_keys() {
-    # Check all required base64 files exist in build directory
-    for file in module-signing.key.b64 module-signing.crt.b64 module-signing.der.b64; do
-        if [ ! -f "$BUILD_DIR/$file" ]; then
-            echo "❌ ERROR: Secret file '$BUILD_DIR/$file' not found!"
+    echo "🔐 Validating module signing keys in /etc/pki/module-signing/..."
+
+    # Check all required decoded files exist in final location
+    SIGNING_DIR="/etc/pki/module-signing"
+
+    for file in module-signing.key module-signing.crt module-signing.der; do
+        if [ ! -f "$SIGNING_DIR/$file" ]; then
+            echo "❌ ERROR: Required file '$SIGNING_DIR/$file' not found!"
+            echo "Available files in $SIGNING_DIR:"
+            ls -la "$SIGNING_DIR/" 2>/dev/null || echo "Directory doesn't exist"
             exit 1
         fi
     done
-    echo "✅ Decoded module signing secrets successfully."
+
+    # Verify permissions are correct
+    if [ ! -r "$SIGNING_DIR/module-signing.key" ]; then
+        echo "❌ ERROR: module-signing.key is not readable"
+        exit 1
+    fi
+
+    echo "✅ All module signing keys validated successfully in $SIGNING_DIR"
 }
 
 # 🔧 Invoke the secrets setup
