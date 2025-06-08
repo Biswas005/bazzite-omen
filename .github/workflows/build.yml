@@ -77,11 +77,11 @@ jobs:
           # This generates all the tags for your image, you can add custom tags here too!
           # By default, it should generate "latest" and "latest.(date here)".
           tags: |
-            type=raw,value=latest${{ matrix.image-flavor.suffix }}
-            type=raw,value=latest${{ matrix.image-flavor.suffix }}.{{date 'YYYYMMDD'}}
-            type=raw,value={{date 'YYYYMMDD'}}${{ matrix.image-flavor.suffix }}
-            type=sha,enable=${{ github.event_name == 'pull_request' }},suffix=${{ matrix.image-flavor.suffix }}
-            type=ref,event=pr,suffix=${{ matrix.image-flavor.suffix }}
+            type=raw,value=latest
+            type=raw,value=latest.{{date 'YYYYMMDD'}}
+            type=raw,value={{date 'YYYYMMDD'}}
+            type=sha,enable=${{ github.event_name == 'pull_request' }}
+            type=ref,event=pr
           labels: |
             io.artifacthub.package.readme-url=https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}/refs/heads/main/README.md
             org.opencontainers.image.created=${{ steps.date.outputs.date }}
@@ -91,7 +91,7 @@ jobs:
             org.opencontainers.image.title=${{ env.IMAGE_NAME }}-${{ matrix.image-flavor.name }}
             org.opencontainers.image.url=https://github.com/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
             org.opencontainers.image.vendor=${{ github.repository_owner }}
-            org.opencontainers.image.version=latest${{ matrix.image-flavor.suffix }}
+            org.opencontainers.image.version=latest
             io.artifacthub.package.deprecated=false
             io.artifacthub.package.keywords=bootc,ublue,universal-blue,bazzite,${{ matrix.image-flavor.name }}
             io.artifacthub.package.license=Apache-2.0
