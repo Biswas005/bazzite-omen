@@ -33,11 +33,9 @@ jobs:
           - name: "regular"
             base: "ghcr.io/ublue-os/bazzite:stable"
             suffix: ""
-            image_name: "bazzite-omen"
           - name: "nvidia"
             base: "ghcr.io/ublue-os/bazzite-nvidia:stable"
-            suffix: "-nvidia-nvidia-open"
-            image_name: "bazzite-omen-nvidia-open"
+            suffix: "-nvidia"
 
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ matrix.image-flavor.name }}
@@ -98,9 +96,6 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
             BASE_IMAGE=${{ matrix.image-flavor.base }}
-            BAZZITE_MODULE_SIGNING_KEY=${{ env.BAZZITE_MODULE_SIGNING_KEY }}
-            BAZZITE_MODULE_SIGNING_CRT=${{ env.BAZZITE_MODULE_SIGNING_CRT }}
-            BAZZITE_MODULE_SIGNING_DER=${{ env.BAZZITE_MODULE_SIGNING_DER }}
           oci: false
 
       - name: Login to GitHub Container Registry
