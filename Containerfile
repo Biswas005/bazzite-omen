@@ -1,26 +1,19 @@
-# Allow build scripts to be referenced without being copied into the final image
+# Stage to copy build files
 FROM scratch AS ctx
 COPY build_files /
-
-# Inject GitHub secrets as build args
-ARG BAZZITE_MODULE_SIGNING_KEY
-ARG BAZZITE_MODULE_SIGNING_CRT
-ARG BAZZITE_MODULE_SIGNING_DER
-
-ENV BAZZITE_MODULE_SIGNING_KEY=${BAZZITE_MODULE_SIGNING_KEY}
-ENV BAZZITE_MODULE_SIGNING_CRT=${BAZZITE_MODULE_SIGNING_CRT}
-ENV BAZZITE_MODULE_SIGNING_DER=${BAZZITE_MODULE_SIGNING_DER}
 
 # Base Image
 FROM ghcr.io/ublue-os/bazzite-nvidia:latest
 
-### MODIFICATIONS
+# Use BuildKit secrets to mount keys during build
 RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=cache,dst=/var/cache \
     --mount=type=cache,dst=/var/log \
     --mount=type=tmpfs,dst=/tmp \
+    --mount=type=secret,id=module_signing_key,target=/etc/pki/module-signing/module-signing.key \
+    --mount=type=secret,id=module_signing_crt,target=/etc/pki/module-signing/module-signing.crt \
+    --mount=type=secret,id=module_signing_der,target=/etc/pki/module-signing/module-signing.der \
     /ctx/build.sh && \
     ostree container commit
 
-### LINTING
 RUN bootc container lint

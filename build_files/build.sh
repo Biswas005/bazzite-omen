@@ -44,39 +44,22 @@ echo "✅ Copied kernel module and certificate files into build directory"
 
 # --- Persistent Key Setup ---
 setup_github_secrets_keys() {
-    echo "🔐 Setting up Secure Boot keys from GitHub Secrets..."
+    if [ ! -f /etc/pki/module-signing/module-signing.key ]; then
+    echo "❌ ERROR: module-signing.key secret not found!"
+    exit 1
+fi
 
-    mkdir -p /etc/pki/module-signing/
+if [ ! -f /etc/pki/module-signing/module-signing.crt ]; then
+    echo "❌ ERROR: module-signing.crt secret not found!"
+    exit 1
+fi
 
-    # Decode and store the private key
-    if [ -n "${BAZZITE_MODULE_SIGNING_KEY:-}" ]; then
-        echo "$BAZZITE_MODULE_SIGNING_KEY" | base64 -d > /etc/pki/module-signing/module-signing.key
-        chmod 600 /etc/pki/module-signing/module-signing.key
-    else
-        echo "❌ ERROR: BAZZITE_MODULE_SIGNING_KEY not set."
-        return 1
-    fi
+if [ ! -f /etc/pki/module-signing/module-signing.der ]; then
+    echo "❌ ERROR: module-signing.der secret not found!"
+    exit 1
+fi
 
-    # Decode and store the signing certificate
-    if [ -n "${BAZZITE_MODULE_SIGNING_CRT:-}" ]; then
-        echo "$BAZZITE_MODULE_SIGNING_CRT" | base64 -d > /etc/pki/module-signing/module-signing.crt
-        chmod 644 /etc/pki/module-signing/module-signing.crt
-    else
-        echo "❌ ERROR: BAZZITE_MODULE_SIGNING_CRT not set."
-        return 1
-    fi
-
-    # Decode and store the DER certificate
-    if [ -n "${BAZZITE_MODULE_SIGNING_DER:-}" ]; then
-        echo "$BAZZITE_MODULE_SIGNING_DER" | base64 -d > /etc/pki/module-signing/module-signing.der
-        chmod 644 /etc/pki/module-signing/module-signing.der
-    else
-        echo "❌ ERROR: BAZZITE_MODULE_SIGNING_DER not set."
-        return 1
-    fi
-
-    echo "✅ Secure Boot keys successfully loaded"
-    return 0
+echo "✅ Found all secrets, proceeding with module signing..."
 }
 
 # 🔧 Invoke the secrets setup
