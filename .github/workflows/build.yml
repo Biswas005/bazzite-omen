@@ -36,7 +36,7 @@ jobs:
             image_name: "bazzite-omen"
           - name: "nvidia"
             base: "ghcr.io/ublue-os/bazzite-nvidia:stable"
-            suffix: "-nvidia-open"
+            suffix: "-nvidia-nvidia-open"
             image_name: "bazzite-omen-nvidia-open"
 
     concurrency:
