@@ -27,20 +27,51 @@ if [ ! -d "$KERNEL_SRC_DIR" ]; then
 fi
 echo "📚 Using kernel source from: $KERNEL_SRC_DIR"
 
-# Prepare build environment
 BUILD_DIR="/tmp/hp-wmi-build"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# Copy required base64-encoded secret files from container build context (/ctx)
-for file in module-signing.key.b64 module-signing.crt.b64 module-signing.der.b64; do
+# Copy source files from /ctx
+for file in hp-wmi.c; do
     if [ ! -f "/ctx/$file" ]; then
-        echo "❌ ERROR: Required secret file '/ctx/$file' is missing"
+        echo "❌ ERROR: Required source file '/ctx/$file' is missing"
         exit 1
     fi
     cp "/ctx/$file" .
 done
-echo "✅ Copied base64-encoded module signing secrets into build directory"
+
+# Copy secret base64 files from /run/secrets
+for file in module-signing.key.b64 module-signing.crt.b64 module-signing.der.b64; do
+    if [ ! -f "/run/secrets/$file" ]; then
+        echo "❌ ERROR: Secret file '/run/secrets/$file' not found!"
+        exit 1
+    fi
+    cp "/run/secrets/$file" .
+done
+
+echo "✅ Copied source and secret base64 files into build directory"
+
+# Decode secrets
+base64 -d module-signing.key.b64 > module-signing.key
+base64 -d module-signing.crt.b64 > module-signing.crt
+base64 -d module-signing.der.b64 > module-signing.der
+
+chmod 600 module-signing.key
+
+echo "✅ Decoded module signing secrets successfully."
+
+# Create target dir and copy decoded files
+mkdir -p /etc/pki/module-signing/
+cp module-signing.key /etc/pki/module-signing/
+cp module-signing.crt /etc/pki/module-signing/
+cp module-signing.der /etc/pki/module-signing/
+
+chmod 600 /etc/pki/module-signing/module-signing.key
+chmod 644 /etc/pki/module-signing/module-signing.crt
+chmod 644 /etc/pki/module-signing/module-signing.der
+
+echo "✅ Copied decoded keys and certs to /etc/pki/module-signing/"
+
 
 # --- Persistent Key Setup ---
 setup_github_secrets_keys() {
@@ -51,16 +82,6 @@ setup_github_secrets_keys() {
             exit 1
         fi
     done
-
-    echo "✅ Found all secrets, decoding from base64..."
-
-    # Decode secrets from .b64 files to binary in build directory
-    base64 -d "$BUILD_DIR/module-signing.key.b64" > "$BUILD_DIR/module-signing.key"
-    chmod 600 "$BUILD_DIR/module-signing.key"
-
-    base64 -d "$BUILD_DIR/module-signing.crt.b64" > "$BUILD_DIR/module-signing.crt"
-    base64 -d "$BUILD_DIR/module-signing.der.b64" > "$BUILD_DIR/module-signing.der"
-
     echo "✅ Decoded module signing secrets successfully."
 }
 
@@ -227,6 +248,14 @@ cat > /etc/modprobe.d/hp-wmi.conf << 'MODPROBE_CONF_EOF'
 options hp-wmi parameter=value
 MODPROBE_CONF_EOF
 
+# Securely delete the decoded private key file after use
+if [ -f "$BUILD_DIR/module-signing.key" ]; then
+    shred -u "$BUILD_DIR/module-signing.key" || rm -f "$BUILD_DIR/module-signing.key"
+    echo "✅ Deleted the decoded private key file securely."
+else
+    echo "⚠️ No private key file found to delete."
+fi
+
 # Clean up build directory
 cd /
 rm -rf "$BUILD_DIR"
@@ -324,6 +353,7 @@ VSCODE_REPO_EOF
 
 dnf5 install -y code
 echo "Visual Studio Code installed successfully!"
+
 
 # Enable services
 systemctl enable podman.socket
