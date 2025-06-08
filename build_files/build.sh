@@ -1,99 +1,87 @@
 #!/bin/bash
 set -ouex pipefail
 
-echo "Build script starting..."
-echo "Base image: ${BASE_IMAGE:-unknown}"
+echo "🚀 Build script starting..."
+echo "📦 Base image: ${BASE_IMAGE:-unknown}"
 
 # Check if we're building on a NVIDIA-enabled base image
 NVIDIA_BASE=false
 if [[ "${BASE_IMAGE:-}" == *"nvidia"* ]]; then
     NVIDIA_BASE=true
-    echo "✓ NVIDIA base image detected - skipping NVIDIA driver installation"
+    echo "🟢 NVIDIA base image detected — skipping NVIDIA driver installation"
 else
-    echo "✓ Regular base image detected - will install NVIDIA drivers"
+    echo "🟡 Regular base image detected — NVIDIA drivers will be installed"
 fi
 
-# Get kernel version and set up build environment
+# Detect and verify kernel version
 KERNEL_VERSION=$(rpm -q kernel --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}')
-echo "Building for kernel version: $KERNEL_VERSION"
+echo "🧠 Detected kernel version: $KERNEL_VERSION"
 
-# Find kernel source directory
 KERNEL_SRC_DIR="/usr/src/kernels/$KERNEL_VERSION"
 if [ ! -d "$KERNEL_SRC_DIR" ]; then
     KERNEL_SRC_DIR=$(find /usr/src/kernels -maxdepth 1 -type d -name "*" | grep -v "^/usr/src/kernels$" | head -1)
     if [ -z "$KERNEL_SRC_DIR" ] || [ ! -d "$KERNEL_SRC_DIR" ]; then
-        echo "ERROR: Kernel source directory not found"
+        echo "❌ ERROR: Kernel source directory not found"
         exit 1
     fi
 fi
-echo "Using kernel source: $KERNEL_SRC_DIR"
+echo "📚 Using kernel source from: $KERNEL_SRC_DIR"
 
-# Create build directory
+# Prepare build environment
 BUILD_DIR="/tmp/hp-wmi-build"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# Copy custom hp-wmi.c source
-if [ ! -f "/ctx/hp-wmi.c" ]; then
-    echo "ERROR: hp-wmi.c source file not found at /ctx/hp-wmi.c"
-    exit 1
-fi
-cp /ctx/hp-wmi.c .
-cp /ctx/module-signing.crt .
-cp /ctx/module-signing.der .
+# Copy required files from container build context
+for file in hp-wmi.c module-signing.crt module-signing.der; do
+    if [ ! -f "/ctx/$file" ]; then
+        echo "❌ ERROR: Required file '/ctx/$file' is missing"
+        exit 1
+    fi
+    cp "/ctx/$file" .
+done
+echo "✅ Copied kernel module and certificate files into build directory"
 
-# Check if hp-wmi.c was copied successfully
-if [ ! -f "hp-wmi.c" ]; then
-    echo "ERROR: Failed to copy hp-wmi.c to build directory"
-    exit 1
-fi
-# Check if module-signing.crt and module-signing.der were copied successfully
-if [ ! -f "module-signing.crt" ] || [ ! -f "module-signing.der" ]; then
-    echo "ERROR: Failed to copy module-signing.crt or module-signing.der to build directory"
-    exit 1
-fi
-
-# Persistent Key Management Setup
-##################################
-
-# Function to setup persistent keys from GitHub Secrets and local certificates
+# --- Persistent Key Setup ---
 setup_github_secrets_keys() {
-    echo "Setting up persistent keys from GitHub Secrets..."
+    echo "🔐 Setting up Secure Boot keys from GitHub Secrets..."
 
     mkdir -p /etc/pki/module-signing/
 
-    # Decode and write the private key
+    # Decode and store the private key
     if [ -n "${BAZZITE_MODULE_SIGNING_KEY:-}" ]; then
         echo "$BAZZITE_MODULE_SIGNING_KEY" | base64 -d > /etc/pki/module-signing/module-signing.key
         chmod 600 /etc/pki/module-signing/module-signing.key
     else
-        echo "ERROR: BAZZITE_MODULE_SIGNING_KEY not set."
+        echo "❌ ERROR: BAZZITE_MODULE_SIGNING_KEY not set."
         return 1
     fi
 
-    # Decode and write the certificate
+    # Decode and store the signing certificate
     if [ -n "${BAZZITE_MODULE_SIGNING_CRT:-}" ]; then
         echo "$BAZZITE_MODULE_SIGNING_CRT" | base64 -d > /etc/pki/module-signing/module-signing.crt
         chmod 644 /etc/pki/module-signing/module-signing.crt
     else
-        echo "ERROR: BAZZITE_MODULE_SIGNING_CRT not set."
+        echo "❌ ERROR: BAZZITE_MODULE_SIGNING_CRT not set."
         return 1
     fi
 
-    # Decode and write the DER certificate
+    # Decode and store the DER certificate
     if [ -n "${BAZZITE_MODULE_SIGNING_DER:-}" ]; then
         echo "$BAZZITE_MODULE_SIGNING_DER" | base64 -d > /etc/pki/module-signing/module-signing.der
         chmod 644 /etc/pki/module-signing/module-signing.der
     else
-        echo "ERROR: BAZZITE_MODULE_SIGNING_DER not set."
+        echo "❌ ERROR: BAZZITE_MODULE_SIGNING_DER not set."
         return 1
     fi
 
-    echo "✓ All persistent keys and certificates loaded from GitHub Secrets"
+    echo "✅ Secure Boot keys successfully loaded"
     return 0
 }
 
-    
+# 🔧 Invoke the secrets setup
+setup_github_secrets_keys || exit 1
+
 
 # Install base packages (always needed)
 echo "Installing build dependencies..."
@@ -103,18 +91,14 @@ dnf5 install -y kernel-devel kernel-headers gcc make kmod openssl mokutil elfuti
 ##################################
 
 if [ "$NVIDIA_BASE" = false ]; then
-    echo "Installing akmods and NVIDIA drivers..."
-    dnf5 install -y akmods
-    
-    # Try to install NVIDIA packages, but don't fail if they're not available
+    echo "Skipping NVIDIA driver installation (using NVIDIA base image)"
+else
     if dnf5 install -y akmod-nvidia xorg-x11-drv-nvidia nvidia-settings cuda-devel; then
         echo "✓ NVIDIA packages installed successfully"
         NVIDIA_INSTALLED=true
     else
         echo "⚠️  Some NVIDIA packages failed to install - continuing anyway"
         NVIDIA_INSTALLED=false
-    fi
-else
     echo "✓ Skipping NVIDIA driver installation (already present in base image)"
     NVIDIA_INSTALLED=false  # Don't try to sign NVIDIA modules later
 fi

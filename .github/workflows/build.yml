@@ -113,10 +113,11 @@ jobs:
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
-            BASE_IMAGE=${{ matrix.image-flavor.base }}
-            BAZZITE_MODULE_SIGNING_KEY: ${{ secrets.BAZZITE_MODULE_SIGNING_KEY }}
-            BAZZITE_MODULE_SIGNING_CRT: ${{ secrets.BAZZITE_MODULE_SIGNING_CRT }}
-            BAZZITE_MODULE_SIGNING_DER: ${{ secrets.BAZZITE_MODULE_SIGNING_DER }}
+                      BASE_IMAGE=${{ matrix.image-flavor.base }}
+                      BAZZITE_MODULE_SIGNING_KEY=${{ secrets.BAZZITE_MODULE_SIGNING_KEY }}
+                      BAZZITE_MODULE_SIGNING_CRT=${{ secrets.BAZZITE_MODULE_SIGNING_CRT }}
+                      BAZZITE_MODULE_SIGNING_DER=${{ secrets.BAZZITE_MODULE_SIGNING_DER }}
+
           oci: false
 
       # Rechunk is a script that we use on Universal Blue to make sure there isnt a single huge layer when your image gets published.
