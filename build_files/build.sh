@@ -32,40 +32,34 @@ BUILD_DIR="/tmp/hp-wmi-build"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-# Copy required files from container build context
-for file in hp-wmi.c module-signing.crt module-signing.der; do
+# Copy required base64-encoded secret files from container build context (/ctx)
+for file in module-signing.key.b64 module-signing.crt.b64 module-signing.der.b64; do
     if [ ! -f "/ctx/$file" ]; then
-        echo "❌ ERROR: Required file '/ctx/$file' is missing"
+        echo "❌ ERROR: Required secret file '/ctx/$file' is missing"
         exit 1
     fi
     cp "/ctx/$file" .
 done
-echo "✅ Copied kernel module and certificate files into build directory"
+echo "✅ Copied base64-encoded module signing secrets into build directory"
 
 # --- Persistent Key Setup ---
 setup_github_secrets_keys() {
-    # Check all required base64 files exist
-    if [ ! -f /etc/pki/module-signing/module-signing.key.b64 ]; then
-        echo "❌ ERROR: module-signing.b64 secret not found!"
-        exit 1
-    fi
-    if [ ! -f /etc/pki/module-signing/module-signing.crt.b64 ]; then
-        echo "❌ ERROR: module-signing.b64 secret not found!"
-        exit 1
-    fi
-    if [ ! -f /etc/pki/module-signing/module-signing.der.b64 ]; then
-        echo "❌ ERROR: module-signing.b64 secret not found!"
-        exit 1
-    fi
+    # Check all required base64 files exist in build directory
+    for file in module-signing.key.b64 module-signing.crt.b64 module-signing.der.b64; do
+        if [ ! -f "$BUILD_DIR/$file" ]; then
+            echo "❌ ERROR: Secret file '$BUILD_DIR/$file' not found!"
+            exit 1
+        fi
+    done
 
     echo "✅ Found all secrets, decoding from base64..."
 
-    # Decode secrets from .b64 files to binary
-    base64 -d /etc/pki/module-signing/module-signing.key.b64 > /etc/pki/module-signing/module-signing.key
-    chmod 600 /etc/pki/module-signing/module-signing.key
+    # Decode secrets from .b64 files to binary in build directory
+    base64 -d "$BUILD_DIR/module-signing.key.b64" > "$BUILD_DIR/module-signing.key"
+    chmod 600 "$BUILD_DIR/module-signing.key"
 
-    base64 -d /etc/pki/module-signing/module-signing.crt.b64 > /etc/pki/module-signing/module-signing.crt
-    base64 -d /etc/pki/module-signing/module-signing.der.b64 > /etc/pki/module-signing/module-signing.der
+    base64 -d "$BUILD_DIR/module-signing.crt.b64" > "$BUILD_DIR/module-signing.crt"
+    base64 -d "$BUILD_DIR/module-signing.der.b64" > "$BUILD_DIR/module-signing.der"
 
     echo "✅ Decoded module signing secrets successfully."
 }
