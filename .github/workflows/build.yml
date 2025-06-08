@@ -34,10 +34,10 @@ jobs:
         image-flavor:
           - name: "regular"
             base: "ghcr.io/ublue-os/bazzite:stable"
-            image-name: "ghcr.io/biswas005/bazzite-omen"
+            suffix: ""
           - name: "nvidia"
             base: "ghcr.io/ublue-os/bazzite-nvidia:stable"
-            image-name: "ghcr.io/biswas005/bazzite-omen-nvidia-open"
+            suffix: "-nvidia-open"
 
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ matrix.image-flavor.name }}
@@ -109,7 +109,7 @@ jobs:
             ./Containerfile
           # Postfix image name with -custom to make it a little more descriptive
           # Syntax: https://docs.github.com/en/actions/learn-github-actions/expressions#format
-          image: ${{ env.IMAGE_NAME }}
+          image: ${{ env.IMAGE_NAME }}${{ matrix.image-flavor.suffix }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
@@ -166,7 +166,7 @@ jobs:
         id: image_case
         uses: ASzc/change-string-case-action@d0603cd0a7dd490be678164909f65c7737470a7f # v6
         with:
-          string: ${{ env.IMAGE_NAME }}
+          string: ${{ env.IMAGE_NAME }}${{ matrix.image-flavor.suffix }}
 
       - name: Push To GHCR
         uses: redhat-actions/push-to-registry@5ed88d269cf581ea9ef6dd6806d01562096bee9c # v2
