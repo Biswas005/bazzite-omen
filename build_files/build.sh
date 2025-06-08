@@ -333,7 +333,7 @@ else
 fi
 
 
-dnf5 install -y nvidia-container-toolkit nvidia-container-toolkit-selinux
+dnf5 install -y nvidia-container-toolkit
 
 
 # Install Visual Studio Code
