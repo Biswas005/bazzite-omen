@@ -37,7 +37,7 @@ jobs:
             suffix: ""
           - name: "nvidia"
             base: "ghcr.io/ublue-os/bazzite-nvidia:stable"
-            suffix: ""
+            suffix: "-nvidia-open"
 
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ matrix.image-flavor.name }}
@@ -199,4 +199,4 @@ jobs:
         env:
           TAGS: ${{ steps.push.outputs.digest }}
           COSIGN_EXPERIMENTAL: false
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.SIGNING_SECRET }}
