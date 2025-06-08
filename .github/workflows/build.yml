@@ -34,10 +34,10 @@ jobs:
         image-flavor:
           - name: "regular"
             base: "ghcr.io/ublue-os/bazzite:stable"
-            suffix: ""
+            image-name: "ghcr.io/biswas005/bazzite-omen"
           - name: "nvidia"
             base: "ghcr.io/ublue-os/bazzite-nvidia:stable"
-            suffix: "-nvidia-open"
+            image-name: "ghcr.io/biswas005/bazzite-omen-nvidia-open"
 
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ matrix.image-flavor.name }}
