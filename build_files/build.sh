@@ -107,22 +107,6 @@ setup_github_secrets_keys || exit 1
 echo "Installing build dependencies..."
 dnf5 install -y kernel-devel kernel-headers gcc make kmod openssl mokutil elfutils-libelf-devel tmux
 
-# Conditional NVIDIA Installation
-##################################
-
-if [ "$NVIDIA_BASE" = false ]; then
-    echo "Skipping NVIDIA driver installation (using NVIDIA base image)"
-else
-    if dnf5 install -y akmod-nvidia xorg-x11-drv-nvidia nvidia-settings cuda-devel; then
-        echo "✓ NVIDIA packages installed successfully"
-        NVIDIA_INSTALLED=true
-    else
-        echo "⚠️  Some NVIDIA packages failed to install - continuing anyway"
-        NVIDIA_INSTALLED=false
-    echo "✓ Skipping NVIDIA driver installation (already present in base image)"
-    NVIDIA_INSTALLED=false  # Don't try to sign NVIDIA modules later
-fi
-
 # Persistent Key Management
 ############################
 
