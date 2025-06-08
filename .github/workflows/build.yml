@@ -114,9 +114,9 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
                       BASE_IMAGE=${{ matrix.image-flavor.base }}
-                      BAZZITE_MODULE_SIGNING_KEY=${{ secrets.BAZZITE_MODULE_SIGNING_KEY }}
-                      BAZZITE_MODULE_SIGNING_CRT=${{ secrets.BAZZITE_MODULE_SIGNING_CRT }}
-                      BAZZITE_MODULE_SIGNING_DER=${{ secrets.BAZZITE_MODULE_SIGNING_DER }}
+                      module_signing_key=${{ secrets.BAZZITE_MODULE_SIGNING_KEY }}
+                      module_signing_crt=${{ secrets.BAZZITE_MODULE_SIGNING_CRT }}
+                      module_signing_der=${{ secrets.BAZZITE_MODULE_SIGNING_DER }}
 
           oci: false
 
