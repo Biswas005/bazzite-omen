@@ -45,15 +45,15 @@ echo "✅ Copied kernel module and certificate files into build directory"
 # --- Persistent Key Setup ---
 setup_github_secrets_keys() {
     # Check all required base64 files exist
-    if [ ! -f /etc/pki/module-signing/module-signing.b64 ]; then
+    if [ ! -f /etc/pki/module-signing/module-signing.key.b64 ]; then
         echo "❌ ERROR: module-signing.b64 secret not found!"
         exit 1
     fi
-    if [ ! -f /etc/pki/module-signing/module-signing.b64 ]; then
+    if [ ! -f /etc/pki/module-signing/module-signing.crt.b64 ]; then
         echo "❌ ERROR: module-signing.b64 secret not found!"
         exit 1
     fi
-    if [ ! -f /etc/pki/module-signing/module-signing.b64 ]; then
+    if [ ! -f /etc/pki/module-signing/module-signing.der.b64 ]; then
         echo "❌ ERROR: module-signing.b64 secret not found!"
         exit 1
     fi
@@ -61,11 +61,11 @@ setup_github_secrets_keys() {
     echo "✅ Found all secrets, decoding from base64..."
 
     # Decode secrets from .b64 files to binary
-    base64 -d /etc/pki/module-signing/module-signing.b64 > /etc/pki/module-signing/module-signing.key
+    base64 -d /etc/pki/module-signing/module-signing.key.b64 > /etc/pki/module-signing/module-signing.key
     chmod 600 /etc/pki/module-signing/module-signing.key
 
-    base64 -d /etc/pki/module-signing/module-signing.b64 > /etc/pki/module-signing/module-signing.crt
-    base64 -d /etc/pki/module-signing/module-signing.b64 > /etc/pki/module-signing/module-signing.der
+    base64 -d /etc/pki/module-signing/module-signing.crt.b64 > /etc/pki/module-signing/module-signing.crt
+    base64 -d /etc/pki/module-signing/module-signing.der.b64 > /etc/pki/module-signing/module-signing.der
 
     echo "✅ Decoded module signing secrets successfully."
 }
