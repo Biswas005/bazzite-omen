@@ -333,7 +333,6 @@ else
 fi
 
 
-dnf5 install -y cuda-toolkit
 dnf5 install -y nvidia-container-toolkit nvidia-container-toolkit-selinux
 
 
