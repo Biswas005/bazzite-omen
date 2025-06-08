@@ -6,8 +6,11 @@ echo "📦 Base image: ${BASE_IMAGE:-unknown}"
 
 # Check if we're building on a NVIDIA-enabled base image
 NVIDIA_BASE=false
+NVIDIA_INSTALLED=false  # Initialize the variable
+
 if [[ "${BASE_IMAGE:-}" == *"nvidia"* ]]; then
     NVIDIA_BASE=true
+    NVIDIA_INSTALLED=true  # Set to true if using NVIDIA base
     echo "🟢 NVIDIA base image detected — skipping NVIDIA driver installation"
 else
     echo "🟡 Regular base image detected — NVIDIA drivers will be installed"
@@ -102,10 +105,21 @@ setup_github_secrets_keys() {
 # 🔧 Invoke the secrets setup
 setup_github_secrets_keys || exit 1
 
-
 # Install base packages (always needed)
 echo "Installing build dependencies..."
 dnf5 install -y kernel-devel kernel-headers gcc make kmod openssl mokutil elfutils-libelf-devel tmux
+
+# Install NVIDIA drivers if not using NVIDIA base
+if [ "$NVIDIA_BASE" = false ]; then
+    echo "Installing NVIDIA drivers via akmods..."
+    if dnf5 install -y akmod-nvidia xorg-x11-drv-nvidia-cuda; then
+        NVIDIA_INSTALLED=true
+        echo "✅ NVIDIA drivers installed successfully"
+    else
+        echo "❌ NVIDIA driver installation failed"
+        NVIDIA_INSTALLED=false
+    fi
+fi
 
 # Persistent Key Management
 ############################
@@ -246,19 +260,32 @@ cat > /etc/modprobe.d/hp-wmi.conf << 'MODPROBE_CONF_EOF'
 options hp-wmi parameter=value
 MODPROBE_CONF_EOF
 
-# Securely delete the decoded private key file after use
-if [ -f "$BUILD_DIR/module-signing.key" ]; then
-    shred -u "$BUILD_DIR/module-signing.key" || rm -f "$BUILD_DIR/module-signing.key"
-    echo "✅ Deleted the decoded private key file securely."
-else
-    echo "⚠️ No private key file found to delete."
-fi
-
 # Clean up build directory
 cd /
 rm -rf "$BUILD_DIR"
 
 echo "hp-wmi module installation completed successfully!"
+
+# Securely delete only the private key files after use
+echo "🧹 Cleaning up private key files..."
+
+# Clean up build directory private key
+if [ -f "$BUILD_DIR/module-signing.key" ]; then
+    shred -u "$BUILD_DIR/module-signing.key" || rm -f "$BUILD_DIR/module-signing.key"
+    echo "✅ Deleted build directory private key securely."
+else
+    echo "⚠️ No private key file found in build directory."
+fi
+
+# Clean up any remaining private key in /tmp/secrets (if it still exists)
+# Note: This should already be cleaned up by the Dockerfile, but just in case
+if [ -f "/tmp/secrets/module-signing.key" ]; then
+    shred -u "/tmp/secrets/module-signing.key" || rm -f "/tmp/secrets/module-signing.key"
+    echo "✅ Deleted /tmp/secrets private key securely."
+fi
+
+echo "🔒 Private key cleanup completed."
+echo "📋 Certificate files (.crt and .der) preserved for MOK enrollment."
 
 # Conditional NVIDIA Module Building and Signing
 ##################################################
@@ -328,9 +355,7 @@ else
     fi
 fi
 
-
 dnf5 install -y nvidia-container-toolkit
-
 
 # Install Visual Studio Code
 ##############################
@@ -351,7 +376,6 @@ VSCODE_REPO_EOF
 
 dnf5 install -y code
 echo "Visual Studio Code installed successfully!"
-
 
 # Enable services
 systemctl enable podman.socket
