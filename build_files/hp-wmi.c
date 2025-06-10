@@ -1305,7 +1305,7 @@ static const struct omen_power_profile omen_profiles[] = {
     // Balanced
     { 30, 35, 45, 125,   1, 0, 0, 80},
     // Performance (max everything)
-    { 45, 54, 65, 150,   1, 1, 0, 87},
+    { 45, 54, 65, 175,   1, 1, 0, 87},
 };
 
 static int platform_profile_omen_get_ec(enum platform_profile_option *profile)
