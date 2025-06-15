@@ -1384,8 +1384,8 @@ static int omen_set_gpu_power(const struct omen_power_profile *p);
 
 // Fan speed level structure
 struct FanLevel {
-    u8 Fan1Level;    // CPU fan speed (0-100%)
-    u8 Fan2Level;    // GPU fan speed (0-100%)
+    u8 Fan1Level;    // CPU fan speed (0-58, interpreted as 0-5800 RPM)
+    u8 Fan2Level;    // GPU fan speed (0-58, interpreted as 0-5800 RPM)
     u8 Temperature;  // Temperature in Celsius
 };
 
@@ -1396,18 +1396,18 @@ struct FanTable {
     struct FanLevel Level[14]; // Fan speed level array
 };
 
-// EMA state for smoothing fan speeds
+// EMA state for smoothing fan speeds (unused but kept for structure)
 static struct {
     u8 cpu_fan_speed[14]; // Per-level EMA state for CPU
     u8 gpu_fan_speed[14]; // Per-level EMA state for GPU
     u8 alpha; // Smoothing factor (scaled by 10, e.g., 7 for 0.7)
 } fan_ema_state = { .alpha = 7 };
 
-// Linear interpolation for fan speed
+// Linear interpolation for fan speed (unused but kept for structure)
 static u8 interpolate_fan_speed(u8 temp, const u8 *temps, const u8 *speeds, int count)
 {
     if (temp <= 42) return 0; // Fan off below 42°C
-    if (temp >= 93) return 100; // Max fan speed at 93°C
+    if (temp >= 90) return 58; // Max fan speed at 90°C
 
     for (int i = 1; i < count; i++) {
         if (temp <= temps[i]) {
@@ -1419,17 +1419,17 @@ static u8 interpolate_fan_speed(u8 temp, const u8 *temps, const u8 *speeds, int 
     return speeds[count-1]; // Return max speed if beyond last point
 }
 
-// Fan curve definitions for Power (Performance) profile
-static const u8 power_temps[] = {42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72, 75, 78, 81, 84, 93};
-static const u8 power_cpu_speeds[] = {23, 24, 25, 26, 28, 30, 32, 34, 36, 38, 41, 44, 47, 50, 55, 100};
-static const u8 power_gpu_speeds[] = {24, 26, 27, 29, 31, 33, 35, 37, 40, 43, 46, 49, 52, 55, 57, 100};
+// Fan curve definitions for Power (Performance) profile, max speed 58 (5800 RPM)
+static const u8 power_temps[14] = {42, 43, 46, 49, 52, 55, 58, 61, 64, 67, 70, 73, 76, 90};
+static const u8 power_cpu_speeds[14] = {0, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 43, 46, 58};
+static const u8 power_gpu_speeds[14] = {0, 22, 24, 26, 29, 31, 33, 35, 38, 40, 42, 45, 48, 58};
 
-// Fan curve definitions for Silent (Default) profile
-static const u8 silent_temps[] = {42, 50, 55, 60, 65, 70, 75, 80, 85, 93};
-static const u8 silent_cpu_speeds[] = {0, 21, 25, 30, 35, 40, 45, 50, 55, 100};
-static const u8 silent_gpu_speeds[] = {0, 0, 25, 30, 35, 40, 45, 50, 57, 100};
+// Fan curve definitions for Silent (Default) profile, max speed 58 (5800 RPM)
+static const u8 silent_temps[14] = {42, 45, 46, 49, 52, 55, 58, 61, 64, 67, 70, 73, 76, 90};
+static const u8 silent_cpu_speeds[14] = {0, 22, 23, 24, 26, 28, 30, 32, 34, 36, 38, 41, 44, 58};
+static const u8 silent_gpu_speeds[14] = {0, 22, 22, 22, 22, 22, 24, 26, 28, 31, 34, 37, 40, 58};
 
-// Apply EMA to smooth fan speed transitions using fixed-point arithmetic
+// Apply EMA to smooth fan speed transitions (unused but kept for structure)
 static u8 apply_ema(u8 current_speed, u8 target_speed, u8 alpha)
 {
     // alpha is scaled by 10, so alpha=7 means 0.7
@@ -1441,40 +1441,22 @@ static u8 apply_ema(u8 current_speed, u8 target_speed, u8 alpha)
 // Set fan speeds for all 14 levels based on profile
 static int set_fan_speeds(enum platform_profile_option profile, struct FanTable *fan_table)
 {
-    // Define 14 temperature points, evenly spaced from 42°C to 93°C
-    u8 temps[14];
     int i;
-    const int temp_range = 93 - 42; // 51°C range
-    const int step = temp_range / 13; // Approx 3.92°C per step
 
-    for (i = 0; i < 14; i++) {
-        temps[i] = 42 + i * step;
-        if (i == 13) temps[i] = 93; // Ensure last point is exactly 93°C
-    }
-
-    // Populate FanTable with 14 levels
+    // Populate FanTable with 14 levels directly from profile arrays
     fan_table->FanCount = 2;
     fan_table->LevelCount = 14;
 
     for (i = 0; i < 14; i++) {
-        u8 cpu_speed, gpu_speed;
-
         if (profile == PLATFORM_PROFILE_PERFORMANCE) {
-            cpu_speed = interpolate_fan_speed(temps[i], power_temps, power_cpu_speeds, ARRAY_SIZE(power_temps));
-            gpu_speed = interpolate_fan_speed(temps[i], power_temps, power_gpu_speeds, ARRAY_SIZE(power_temps));
+            fan_table->Level[i].Fan1Level = power_cpu_speeds[i];
+            fan_table->Level[i].Fan2Level = power_gpu_speeds[i];
+            fan_table->Level[i].Temperature = power_temps[i];
         } else {
-            cpu_speed = interpolate_fan_speed(temps[i], silent_temps, silent_cpu_speeds, ARRAY_SIZE(silent_temps));
-            gpu_speed = interpolate_fan_speed(temps[i], silent_temps, silent_gpu_speeds, ARRAY_SIZE(silent_temps));
+            fan_table->Level[i].Fan1Level = silent_cpu_speeds[i];
+            fan_table->Level[i].Fan2Level = silent_gpu_speeds[i];
+            fan_table->Level[i].Temperature = silent_temps[i];
         }
-
-        // Apply EMA per level
-        fan_ema_state.cpu_fan_speed[i] = apply_ema(fan_ema_state.cpu_fan_speed[i], cpu_speed, fan_ema_state.alpha);
-        fan_ema_state.gpu_fan_speed[i] = apply_ema(fan_ema_state.gpu_fan_speed[i], gpu_speed, fan_ema_state.alpha);
-
-        // Set level values
-        fan_table->Level[i].Fan1Level = fan_ema_state.cpu_fan_speed[i];
-        fan_table->Level[i].Fan2Level = fan_ema_state.gpu_fan_speed[i];
-        fan_table->Level[i].Temperature = temps[i];
     }
 
     // Perform WMI query to set fan speeds
