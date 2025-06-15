@@ -1400,8 +1400,8 @@ struct FanTable {
 static struct {
     u8 cpu_fan_speed;
     u8 gpu_fan_speed;
-    float alpha; // Smoothing factor (0 < alpha < 1)
-} fan_ema_state = { .cpu_fan_speed = 0, .gpu_fan_speed = 0, .alpha = 0.7 };
+    u8 alpha; // Smoothing factor (scaled by 10, e.g., 7 for 0.7)
+} fan_ema_state = { .cpu_fan_speed = 0, .gpu_fan_speed = 0, .alpha = 7 };
 
 // Linear interpolation for fan speed
 static u8 interpolate_fan_speed(u8 temp, const u8 *temps, const u8 *speeds, int count)
@@ -1429,10 +1429,13 @@ static const u8 silent_temps[] = {42, 50, 55, 60, 65, 70, 75, 80, 85, 93};
 static const u8 silent_cpu_speeds[] = {0, 21, 25, 30, 35, 40, 45, 50, 55, 100};
 static const u8 silent_gpu_speeds[] = {0, 0, 25, 30, 35, 40, 45, 50, 57, 100};
 
-// Apply EMA to smooth fan speed transitions
-static u8 apply_ema(u8 current_speed, u8 target_speed, float alpha)
+// Apply EMA to smooth fan speed transitions using fixed-point arithmetic
+static u8 apply_ema(u8 current_speed, u8 target_speed, u8 alpha)
 {
-    return (u8)(alpha * target_speed + (1 - alpha) * current_speed);
+    // alpha is scaled by 10, so alpha=7 means 0.7
+    // Result = (alpha * target + (10 - alpha) * current) / 10
+    u16 result = (alpha * target_speed + (10 - alpha) * current_speed) / 10;
+    return (u8)result;
 }
 
 // Set fan speeds based on current temperature and profile
@@ -1471,7 +1474,16 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
     enum hp_thermal_profile_omen_flags flags = 0;
     const struct omen_power_profile *opp = NULL;
     struct FanTable fan_table = {0};
-    u8 current_temp = 0; // Placeholder: Replace with actual temperature reading
+    u8 current_temp;
+    int ret;
+
+    // Read current temperature (replace with appropriate query if needed)
+    ret = hp_wmi_read_int(HPWMI_HDDTEMP_QUERY);
+    if (ret < 0) {
+        pr_err("Failed to read temperature: %d\n", ret);
+        return ret;
+    }
+    current_temp = (u8)ret;
 
     tp_version = omen_get_thermal_policy_version();
     if (tp_version < 0 || tp_version > 1)
