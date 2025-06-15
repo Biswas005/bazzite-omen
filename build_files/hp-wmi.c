@@ -1392,16 +1392,16 @@ struct FanLevel {
 // Fan table structure
 struct FanTable {
     u8 FanCount;     // Number of fans (2 for CPU and GPU)
-    u8 LevelCount;   // Number of level entries (14)
+    u8 LevelCount;   // Number of level entries (up to 14)
     struct FanLevel Level[14]; // Fan speed level array
 };
 
 // EMA state for smoothing fan speeds
 static struct {
-    u8 cpu_fan_speed;
-    u8 gpu_fan_speed;
+    u8 cpu_fan_speed[14]; // Per-level EMA state for CPU
+    u8 gpu_fan_speed[14]; // Per-level EMA state for GPU
     u8 alpha; // Smoothing factor (scaled by 10, e.g., 7 for 0.7)
-} fan_ema_state = { .cpu_fan_speed = 0, .gpu_fan_speed = 0, .alpha = 7 };
+} fan_ema_state = { .alpha = 7 };
 
 // Linear interpolation for fan speed
 static u8 interpolate_fan_speed(u8 temp, const u8 *temps, const u8 *speeds, int count)
@@ -1438,29 +1438,44 @@ static u8 apply_ema(u8 current_speed, u8 target_speed, u8 alpha)
     return (u8)result;
 }
 
-// Set fan speeds based on current temperature and profile
-static int set_fan_speeds(u8 temp, enum platform_profile_option profile, struct FanTable *fan_table)
+// Set fan speeds for all 14 levels based on profile
+static int set_fan_speeds(enum platform_profile_option profile, struct FanTable *fan_table)
 {
-    u8 cpu_speed, gpu_speed;
+    // Define 14 temperature points, evenly spaced from 42°C to 93°C
+    u8 temps[14];
+    int i;
+    const int temp_range = 93 - 42; // 51°C range
+    const int step = temp_range / 13; // Approx 3.92°C per step
 
-    if (profile == PLATFORM_PROFILE_PERFORMANCE) {
-        cpu_speed = interpolate_fan_speed(temp, power_temps, power_cpu_speeds, ARRAY_SIZE(power_temps));
-        gpu_speed = interpolate_fan_speed(temp, power_temps, power_gpu_speeds, ARRAY_SIZE(power_temps));
-    } else {
-        cpu_speed = interpolate_fan_speed(temp, silent_temps, silent_cpu_speeds, ARRAY_SIZE(silent_temps));
-        gpu_speed = interpolate_fan_speed(temp, silent_temps, silent_gpu_speeds, ARRAY_SIZE(silent_temps));
+    for (i = 0; i < 14; i++) {
+        temps[i] = 42 + i * step;
+        if (i == 13) temps[i] = 93; // Ensure last point is exactly 93°C
     }
 
-    // Apply EMA
-    fan_ema_state.cpu_fan_speed = apply_ema(fan_ema_state.cpu_fan_speed, cpu_speed, fan_ema_state.alpha);
-    fan_ema_state.gpu_fan_speed = apply_ema(fan_ema_state.gpu_fan_speed, gpu_speed, fan_ema_state.alpha);
-
-    // Populate FanTable
+    // Populate FanTable with 14 levels
     fan_table->FanCount = 2;
-    fan_table->LevelCount = 1; // Single level for current temperature
-    fan_table->Level[0].Fan1Level = fan_ema_state.cpu_fan_speed;
-    fan_table->Level[0].Fan2Level = fan_ema_state.gpu_fan_speed;
-    fan_table->Level[0].Temperature = temp;
+    fan_table->LevelCount = 14;
+
+    for (i = 0; i < 14; i++) {
+        u8 cpu_speed, gpu_speed;
+
+        if (profile == PLATFORM_PROFILE_PERFORMANCE) {
+            cpu_speed = interpolate_fan_speed(temps[i], power_temps, power_cpu_speeds, ARRAY_SIZE(power_temps));
+            gpu_speed = interpolate_fan_speed(temps[i], power_temps, power_gpu_speeds, ARRAY_SIZE(power_temps));
+        } else {
+            cpu_speed = interpolate_fan_speed(temps[i], silent_temps, silent_cpu_speeds, ARRAY_SIZE(silent_temps));
+            gpu_speed = interpolate_fan_speed(temps[i], silent_temps, silent_gpu_speeds, ARRAY_SIZE(silent_temps));
+        }
+
+        // Apply EMA per level
+        fan_ema_state.cpu_fan_speed[i] = apply_ema(fan_ema_state.cpu_fan_speed[i], cpu_speed, fan_ema_state.alpha);
+        fan_ema_state.gpu_fan_speed[i] = apply_ema(fan_ema_state.gpu_fan_speed[i], gpu_speed, fan_ema_state.alpha);
+
+        // Set level values
+        fan_table->Level[i].Fan1Level = fan_ema_state.cpu_fan_speed[i];
+        fan_table->Level[i].Fan2Level = fan_ema_state.gpu_fan_speed[i];
+        fan_table->Level[i].Temperature = temps[i];
+    }
 
     // Perform WMI query to set fan speeds
     return hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM, fan_table,
@@ -1474,16 +1489,6 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
     enum hp_thermal_profile_omen_flags flags = 0;
     const struct omen_power_profile *opp = NULL;
     struct FanTable fan_table = {0};
-    u8 current_temp;
-    int ret;
-
-    // Read current temperature (replace with appropriate query if needed)
-    ret = hp_wmi_read_int(HPWMI_HDDTEMP_QUERY);
-    if (ret < 0) {
-        pr_err("Failed to read temperature: %d\n", ret);
-        return ret;
-    }
-    current_temp = (u8)ret;
 
     tp_version = omen_get_thermal_policy_version();
     if (tp_version < 0 || tp_version > 1)
@@ -1520,8 +1525,8 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
         if (err < 0)
             return err;
 
-        // Set fan speeds based on current temperature
-        err = set_fan_speeds(current_temp, profile, &fan_table);
+        // Set fan speeds for all 14 levels
+        err = set_fan_speeds(profile, &fan_table);
         if (err < 0) {
             pr_err("Failed to set fan speeds: %d\n", err);
             return err;
