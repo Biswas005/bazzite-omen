@@ -1382,87 +1382,14 @@ inline int omen_thermal_profile_ec_timer_set(u8 value)
 static int omen_set_cpu_power(const struct omen_power_profile *p);
 static int omen_set_gpu_power(const struct omen_power_profile *p);
 
-// Fan speed level structure
-struct FanLevel {
-    u8 Fan1Level;    // CPU fan speed (0-255, scaled for 0-5800 RPM)
-    u8 Fan2Level;    // GPU fan speed (0-255, scaled for 0-5800 RPM)
-    u8 Temperature;  // Temperature in Celsius
-};
-
-// Fan table structure
-struct FanTable {
-    u8 FanCount;     // Number of fans (2 for CPU and GPU)
-    u8 LevelCount;   // Number of level entries (9)
-    struct FanLevel Level[9]; // Fan speed level array
-};
-
-// Fan curve definitions for Performance profile, max speed 255 (~5800 RPM)
-static const u8 performance_temps[9] = {50, 55, 60, 65, 70, 75, 80, 85, 90};
-static const u8 performance_cpu_speeds[9] = {0, 97, 110, 123, 136, 150, 171, 202, 255}; // 97 ~2200 RPM, 255 ~5800 RPM
-static const u8 performance_gpu_speeds[9] = {0, 97, 106, 114, 127, 141, 163, 193, 255};
-
-// Fan curve definitions for Balanced profile, max speed 255 (~5800 RPM)
-static const u8 balanced_temps[9] = {50, 55, 60, 65, 70, 75, 80, 85, 90};
-static const u8 balanced_cpu_speeds[9] = {0, 97, 106, 114, 123, 136, 154, 180, 211}; // 211 ~4800 RPM
-static const u8 balanced_gpu_speeds[9] = {0, 0, 0, 97, 106, 119, 141, 167, 211};
-
-// Fan curve definitions for Cool (Eco) profile, max speed 255 (~5800 RPM)
-static const u8 cool_temps[9] = {50, 55, 60, 65, 70, 75, 80, 85, 90};
-static const u8 cool_cpu_speeds[9] = {0, 97, 101, 106, 114, 123, 141, 167, 193}; // 193 ~4400 RPM
-static const u8 cool_gpu_speeds[9] = {0, 0, 0, 97, 106, 114, 132, 158, 193};
-
-// Set fan speeds for all 9 levels based on profile
-static int set_fan_speeds(enum platform_profile_option profile, struct FanTable *fan_table)
-{
-    int i;
-    u8 buffer[128] = {0};
-
-    // Debug: Test single-level table to force ~2200 RPM
-    // Uncomment to test, then recompile
-    /*
-    fan_table->FanCount = 2;
-    fan_table->LevelCount = 1;
-    fan_table->Level[0].Fan1Level = 97; // ~2200 RPM
-    fan_table->Level[0].Fan2Level = 97; // ~2200 RPM
-    fan_table->Level[0].Temperature = 55;
-    memcpy(buffer, fan_table, sizeof(*fan_table));
-    return hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM, buffer, 128, 0);
-    */
-
-    // Populate FanTable with 9 levels
-    fan_table->FanCount = 2;
-    fan_table->LevelCount = 9;
-
-    for (i = 0; i < 9; i++) {
-        if (profile == PLATFORM_PROFILE_PERFORMANCE) {
-            fan_table->Level[i].Fan1Level = performance_cpu_speeds[i];
-            fan_table->Level[i].Fan2Level = performance_gpu_speeds[i];
-            fan_table->Level[i].Temperature = performance_temps[i];
-        } else if (profile == PLATFORM_PROFILE_BALANCED) {
-            fan_table->Level[i].Fan1Level = balanced_cpu_speeds[i];
-            fan_table->Level[i].Fan2Level = balanced_gpu_speeds[i];
-            fan_table->Level[i].Temperature = balanced_temps[i];
-        } else { // PLATFORM_PROFILE_COOL (Eco)
-            fan_table->Level[i].Fan1Level = cool_cpu_speeds[i];
-            fan_table->Level[i].Fan2Level = cool_gpu_speeds[i];
-            fan_table->Level[i].Temperature = cool_temps[i];
-        }
-    }
-
-    // Copy FanTable to 128-byte buffer
-    memcpy(buffer, fan_table, sizeof(*fan_table));
-    return hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM, buffer, 128, 0);
-}
-
-// Modified platform_profile_omen_set_ec to include fan curve logic
 static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 {
     int err, tp, tp_version;
     enum hp_thermal_profile_omen_flags flags = 0;
     const struct omen_power_profile *opp = NULL;
-    struct FanTable fan_table = {0};
 
     tp_version = omen_get_thermal_policy_version();
+
     if (tp_version < 0 || tp_version > 1)
         return -EOPNOTSUPP;
 
@@ -1483,39 +1410,20 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
         return -EOPNOTSUPP;
     }
 
-    // Set thermal profile
+    // Set thermal profile as before
     err = omen_thermal_profile_set(tp);
     if (err < 0)
         return err;
 
-    // Set power profiles
+    // Set power/fan profile
     if (opp) {
-        err = omen_set_gpu_power(opp);
-        if (err < 0)
-            return err;
-        err = omen_set_cpu_power(opp);
-        if (err < 0)
-            return err;
-
-        // Enable user-defined fan mode
-        err = hp_wmi_get_fan_count_userdefine_trigger();
-        if (err < 0) {
-            pr_err("Failed to enable user-defined fan mode: %d\n", err);
-            return err;
-        }
-
-        // Set fan speeds for all 9 levels
-        err = set_fan_speeds(profile, &fan_table);
-        if (err < 0) {
-            pr_err("Failed to set fan speeds: %d\n", err);
-            return err;
-        }
-
-        // Start fan mode watcher to persist settings
-        start_fan_mode_watcher();
-    } else {
-        pr_err("No power profile found for the selected thermal profile\n");
-        return -EINVAL;
+        omen_set_gpu_power(opp);
+        omen_set_cpu_power(opp);
+        // Optionally: implement fan curve logic here if supported by firmware
+		// start_fan_mode_watcher();
+	} else {
+		pr_err("No power profile found for the selected thermal profile\n");
+		return -EINVAL;
     }
 
     if (has_omen_thermal_profile_ec_timer()) {
@@ -1524,7 +1432,8 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
             return err;
 
         if (profile == PLATFORM_PROFILE_PERFORMANCE)
-            flags = HP_OMEN_EC_FLAGS_NOTIMER | HP_OMEN_EC_FLAGS_TURBO;
+            flags = HP_OMEN_EC_FLAGS_NOTIMER |
+                HP_OMEN_EC_FLAGS_TURBO;
 
         err = omen_thermal_profile_ec_flags_set(flags);
         if (err < 0)
