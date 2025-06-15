@@ -226,7 +226,7 @@ enum hp_thermal_profile_omen_v0 {
 enum hp_thermal_profile_omen_v1 {
 	HP_OMEN_V1_THERMAL_PROFILE_DEFAULT	= 0x30,
 	HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE	= 0x31,
-	HP_OMEN_V1_THERMAL_PROFILE_COOL		= 0x50,
+	HP_OMEN_V1_THERMAL_PROFILE_COOL		= 0x100,
 };
 
 enum hp_thermal_profile_omen_flags {
