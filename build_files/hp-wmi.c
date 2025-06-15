@@ -1382,6 +1382,8 @@ inline int omen_thermal_profile_ec_timer_set(u8 value)
 static int omen_set_cpu_power(const struct omen_power_profile *p);
 static int omen_set_gpu_power(const struct omen_power_profile *p);
 
+
+
 // Fan speed level structure
 struct FanLevel {
     u8 Fan1Level;    // CPU fan speed (0-58, interpreted as 0-5800 RPM)
@@ -1392,70 +1394,47 @@ struct FanLevel {
 // Fan table structure
 struct FanTable {
     u8 FanCount;     // Number of fans (2 for CPU and GPU)
-    u8 LevelCount;   // Number of level entries (up to 14)
-    struct FanLevel Level[14]; // Fan speed level array
+    u8 LevelCount;   // Number of level entries (9)
+    struct FanLevel Level[9]; // Fan speed level array
 };
 
-// EMA state for smoothing fan speeds (unused but kept for structure)
-static struct {
-    u8 cpu_fan_speed[14]; // Per-level EMA state for CPU
-    u8 gpu_fan_speed[14]; // Per-level EMA state for GPU
-    u8 alpha; // Smoothing factor (scaled by 10, e.g., 7 for 0.7)
-} fan_ema_state = { .alpha = 7 };
+// Fan curve definitions for Performance profile, max speed 58 (5800 RPM)
+static const u8 performance_temps[9] = {42, 47, 52, 57, 62, 67, 72, 77, 90};
+static const u8 performance_cpu_speeds[9] = {0, 22, 25, 27, 29, 32, 36, 41, 50};
+static const u8 performance_gpu_speeds[9] = {0, 22, 24, 26, 28, 30, 34, 39, 50};
 
-// Linear interpolation for fan speed (unused but kept for structure)
-static u8 interpolate_fan_speed(u8 temp, const u8 *temps, const u8 *speeds, int count)
-{
-    if (temp <= 42) return 0; // Fan off below 42°C
-    if (temp >= 90) return 58; // Max fan speed at 90°C
+// Fan curve definitions for Balanced profile, max speed 58 (5800 RPM)
+static const u8 balanced_temps[9] = {42, 47, 52, 57, 62, 67, 72, 77, 90};
+static const u8 balanced_cpu_speeds[9] = {0, 22, 24, 25, 27, 29, 32, 37, 46};
+static const u8 balanced_gpu_speeds[9] = {0, 0, 0, 22, 24, 26, 30, 35, 46};
 
-    for (int i = 1; i < count; i++) {
-        if (temp <= temps[i]) {
-            u8 t0 = temps[i-1], t1 = temps[i];
-            u8 s0 = speeds[i-1], s1 = speeds[i];
-            return s0 + (s1 - s0) * (temp - t0) / (t1 - t0);
-        }
-    }
-    return speeds[count-1]; // Return max speed if beyond last point
-}
+// Fan curve definitions for Cool (Eco) profile, max speed 58 (5800 RPM)
+static const u8 cool_temps[9] = {42, 47, 52, 57, 62, 67, 72, 77, 90};
+static const u8 cool_cpu_speeds[9] = {0, 22, 23, 24, 25, 27, 30, 34, 44};
+static const u8 cool_gpu_speeds[9] = {0, 0, 0, 22, 23, 25, 28, 32, 44};
 
-// Fan curve definitions for Power (Performance) profile, max speed 58 (5800 RPM)
-static const u8 power_temps[14] = {42, 43, 46, 49, 52, 55, 58, 61, 64, 67, 70, 73, 76, 90};
-static const u8 power_cpu_speeds[14] = {0, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 43, 46, 58};
-static const u8 power_gpu_speeds[14] = {0, 22, 24, 26, 29, 31, 33, 35, 38, 40, 42, 45, 48, 58};
-
-// Fan curve definitions for Silent (Default) profile, max speed 58 (5800 RPM)
-static const u8 silent_temps[14] = {42, 45, 46, 49, 52, 55, 58, 61, 64, 67, 70, 73, 76, 90};
-static const u8 silent_cpu_speeds[14] = {0, 22, 23, 24, 26, 28, 30, 32, 34, 36, 38, 41, 44, 58};
-static const u8 silent_gpu_speeds[14] = {0, 22, 22, 22, 22, 22, 24, 26, 28, 31, 34, 37, 40, 58};
-
-// Apply EMA to smooth fan speed transitions (unused but kept for structure)
-static u8 apply_ema(u8 current_speed, u8 target_speed, u8 alpha)
-{
-    // alpha is scaled by 10, so alpha=7 means 0.7
-    // Result = (alpha * target + (10 - alpha) * current) / 10
-    u16 result = (alpha * target_speed + (10 - alpha) * current_speed) / 10;
-    return (u8)result;
-}
-
-// Set fan speeds for all 14 levels based on profile
+// Set fan speeds for all 9 levels based on profile
 static int set_fan_speeds(enum platform_profile_option profile, struct FanTable *fan_table)
 {
     int i;
 
-    // Populate FanTable with 14 levels directly from profile arrays
+    // Populate FanTable with 9 levels directly from profile arrays
     fan_table->FanCount = 2;
-    fan_table->LevelCount = 14;
+    fan_table->LevelCount = 9;
 
-    for (i = 0; i < 14; i++) {
+    for (i = 0; i < 9; i++) {
         if (profile == PLATFORM_PROFILE_PERFORMANCE) {
-            fan_table->Level[i].Fan1Level = power_cpu_speeds[i];
-            fan_table->Level[i].Fan2Level = power_gpu_speeds[i];
-            fan_table->Level[i].Temperature = power_temps[i];
-        } else {
-            fan_table->Level[i].Fan1Level = silent_cpu_speeds[i];
-            fan_table->Level[i].Fan2Level = silent_gpu_speeds[i];
-            fan_table->Level[i].Temperature = silent_temps[i];
+            fan_table->Level[i].Fan1Level = performance_cpu_speeds[i];
+            fan_table->Level[i].Fan2Level = performance_gpu_speeds[i];
+            fan_table->Level[i].Temperature = performance_temps[i];
+        } else if (profile == PLATFORM_PROFILE_BALANCED) {
+            fan_table->Level[i].Fan1Level = balanced_cpu_speeds[i];
+            fan_table->Level[i].Fan2Level = balanced_gpu_speeds[i];
+            fan_table->Level[i].Temperature = balanced_temps[i];
+        } else { // PLATFORM_PROFILE_COOL (Eco)
+            fan_table->Level[i].Fan1Level = cool_cpu_speeds[i];
+            fan_table->Level[i].Fan2Level = cool_gpu_speeds[i];
+            fan_table->Level[i].Temperature = cool_temps[i];
         }
     }
 
@@ -1507,7 +1486,7 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
         if (err < 0)
             return err;
 
-        // Set fan speeds for all 14 levels
+        // Set fan speeds for all 9 levels
         err = set_fan_speeds(profile, &fan_table);
         if (err < 0) {
             pr_err("Failed to set fan speeds: %d\n", err);
