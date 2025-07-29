@@ -396,7 +396,13 @@ else
     echo "ℹ️ No Flatpak version of Firefox found, skipping removal."
 fi
 
+# Install Brave Browser
+########################
+
 echo "Installing Brave Browser..."
+
+# Create the /opt directory structure that Brave needs
+mkdir -p /opt/brave.com
 
 # Create Brave browser repository file manually
 cat > /etc/yum.repos.d/brave-browser.repo << 'BRAVE_REPO_EOF'
@@ -411,12 +417,36 @@ BRAVE_REPO_EOF
 # Import Brave's GPG key
 rpm --import https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
 
-# Install Brave browser
-if dnf5 install -y brave-browser; then
+# Install Brave browser with more permissive RPM options
+if dnf5 install -y brave-browser --setopt=install_weak_deps=False; then
     echo "✅ Brave Browser (RPM) installed successfully!"
+    BRAVE_INSTALLED=true
 else
-    echo "❌ Failed to install Brave Browser (RPM)"
-    exit 1
+    echo "⚠️ Brave Browser (RPM) installation failed, trying alternative approach..."
+    BRAVE_INSTALLED=false
+    
+    # Alternative: Try installing from Flatpak as fallback
+    echo "Installing Brave Browser from Flatpak as fallback..."
+    if flatpak install -y flathub com.brave.Browser; then
+        echo "✅ Brave Browser (Flatpak) installed successfully as fallback!"
+        BRAVE_INSTALLED=true
+    else
+        echo "❌ Both RPM and Flatpak installation of Brave Browser failed"
+        echo "⚠️ Continuing without Brave Browser - you can install it manually later"
+        BRAVE_INSTALLED=false
+    fi
+fi
+
+# Only remove Flatpak version if RPM version was successfully installed
+if [ "$BRAVE_INSTALLED" = true ] && dnf5 list installed brave-browser &>/dev/null; then
+    # Remove Flatpak version of Brave (if installed and RPM version succeeded)
+    if flatpak list | grep -q com.brave.Browser; then
+        echo "Removing Flatpak version of Brave Browser (RPM version installed)..."
+        flatpak remove -y com.brave.Browser
+        echo "✅ Flatpak Brave Browser removed successfully!"
+    else
+        echo "ℹ️ No Flatpak version of Brave Browser found to remove."
+    fi
 fi
 
 # Enable services
