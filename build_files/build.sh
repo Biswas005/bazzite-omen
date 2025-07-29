@@ -396,6 +396,34 @@ else
     echo "ℹ️ No Flatpak version of Firefox found, skipping removal."
 fi
 
+# Install Brave Browser
+########################
+
+echo "Installing Brave Browser..."
+
+# Install dnf-plugins-core if not already installed
+dnf5 install -y dnf-plugins-core
+
+# Add Brave browser repository
+dnf5 config-manager --add-repo https://brave-browser-rpm-release.s3.brave.com/brave-browser.repo
+
+# Install Brave browser
+if dnf5 install -y brave-browser; then
+    echo "✅ Brave Browser (RPM) installed successfully!"
+else
+    echo "❌ Failed to install Brave Browser (RPM)"
+    exit 1
+fi
+
+# Remove Flatpak version of Brave (if installed)
+if flatpak list | grep -q com.brave.Browser; then
+    echo "Removing Flatpak version of Brave Browser..."
+    flatpak remove -y com.brave.Browser
+    echo "✅ Flatpak Brave Browser removed successfully!"
+else
+    echo "ℹ️ No Flatpak version of Brave Browser found, skipping removal."
+fi
+
 # Enable services
 systemctl enable podman.socket
 
