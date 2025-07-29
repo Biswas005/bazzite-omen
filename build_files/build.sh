@@ -377,6 +377,50 @@ VSCODE_REPO_EOF
 dnf5 install -y code
 echo "Visual Studio Code installed successfully!"
 
+# Install Brave Browser (RPM) and Remove Flatpak Brave
+######################################################
+
+echo "Installing Brave Browser (RPM)..."
+# Add Brave's official RPM repository
+cat > /etc/yum.repos.d/brave-browser.repo << 'BRAVE_REPO_EOF'
+[brave-browser]
+name=Brave Browser
+baseurl=https://brave-browser-rpm-release.s3.brave.com/$basearch/
+enabled=1
+gpgcheck=1
+gpgkey=https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
+BRAVE_REPO_EOF
+
+# Install Brave Browser
+dnf5 install -y brave-browser
+echo "✅ Brave Browser (RPM) installed successfully!"
+
+# Remove Flatpak version of Brave (if installed)
+if flatpak list | grep -q com.brave.Browser; then
+    echo "Removing Flatpak version of Brave..."
+    flatpak remove -y com.brave.Browser
+    echo "✅ Flatpak Brave removed successfully!"
+else
+    echo "ℹ️ No Flatpak version of Brave found, skipping removal."
+fi
+
+# Install Firefox (RPM) and Remove Flatpak Firefox
+##################################################
+
+echo "Installing Firefox (RPM)..."
+# Install Firefox from Fedora's repository
+dnf5 install -y firefox
+echo "✅ Firefox (RPM) installed successfully!"
+
+# Remove Flatpak version of Firefox (if installed)
+if flatpak list | grep -q org.mozilla.firefox; then
+    echo "Removing Flatpak version of Firefox..."
+    flatpak remove -y org.mozilla.firefox
+    echo "✅ Flatpak Firefox removed successfully!"
+else
+    echo "ℹ️ No Flatpak version of Firefox found, skipping removal."
+fi
+
 # Enable services
 systemctl enable podman.socket
 
