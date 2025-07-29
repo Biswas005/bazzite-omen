@@ -402,7 +402,9 @@ fi
 echo "Installing Brave Browser..."
 
 # Create the /opt directory structure that Brave needs
+chmod 755 /opt
 mkdir -p /opt/brave.com
+chmod 755 /opt/brave.com
 
 # Create Brave browser repository file manually
 cat > /etc/yum.repos.d/brave-browser.repo << 'BRAVE_REPO_EOF'
