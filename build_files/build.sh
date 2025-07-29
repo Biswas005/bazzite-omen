@@ -401,10 +401,8 @@ fi
 
 echo "Installing Brave Browser..."
 
-# Create the /opt directory structure that Brave needs
-chmod 755 /opt
-mkdir -p /opt/brave.com
-chmod 755 /opt/brave.com
+# Import Brave's GPG key
+rpm --import https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
 
 # Create Brave browser repository file manually
 cat > /etc/yum.repos.d/brave-browser.repo << 'BRAVE_REPO_EOF'
@@ -416,8 +414,7 @@ gpgcheck=1
 gpgkey=https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
 BRAVE_REPO_EOF
 
-# Import Brave's GPG key
-rpm --import https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
+
 
 # Install Brave browser with more permissive RPM options
 if dnf5 install -y brave-browser --setopt=install_weak_deps=False; then
