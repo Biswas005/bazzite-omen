@@ -396,16 +396,20 @@ else
     echo "ℹ️ No Flatpak version of Firefox found, skipping removal."
 fi
 
-# Install Brave Browser
-########################
-
 echo "Installing Brave Browser..."
 
-# Install dnf-plugins-core if not already installed
-dnf5 install -y dnf-plugins-core
+# Create Brave browser repository file manually
+cat > /etc/yum.repos.d/brave-browser.repo << 'BRAVE_REPO_EOF'
+[brave-browser]
+name=Brave Browser
+baseurl=https://brave-browser-rpm-release.s3.brave.com/x86_64/
+enabled=1
+gpgcheck=1
+gpgkey=https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
+BRAVE_REPO_EOF
 
-# Add Brave browser repository
-dnf5 config-manager --add-repo https://brave-browser-rpm-release.s3.brave.com/brave-browser.repo
+# Import Brave's GPG key
+rpm --import https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
 
 # Install Brave browser
 if dnf5 install -y brave-browser; then
@@ -413,15 +417,6 @@ if dnf5 install -y brave-browser; then
 else
     echo "❌ Failed to install Brave Browser (RPM)"
     exit 1
-fi
-
-# Remove Flatpak version of Brave (if installed)
-if flatpak list | grep -q com.brave.Browser; then
-    echo "Removing Flatpak version of Brave Browser..."
-    flatpak remove -y com.brave.Browser
-    echo "✅ Flatpak Brave Browser removed successfully!"
-else
-    echo "ℹ️ No Flatpak version of Brave Browser found, skipping removal."
 fi
 
 # Enable services
