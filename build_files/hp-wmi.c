@@ -913,12 +913,47 @@ static int camera_shutter_input_setup(void)
 	return err;
 }
 
-static DEVICE_ATTR_RO(display);
-static DEVICE_ATTR_RO(hddtemp);
-static DEVICE_ATTR_RW(als);
-static DEVICE_ATTR_RO(dock);
-static DEVICE_ATTR_RO(tablet);
-static DEVICE_ATTR_RW(postcode);
+static int global_pwm_enable = 0; // 0 = auto, 1 = manual
+
+static ssize_t pwm_enable_show(struct device *dev,
+                               struct device_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%d\n", global_pwm_enable);
+}
+
+static ssize_t pwm_enable_store(struct device *dev,
+                                struct device_attribute *attr,
+                                const char *buf, size_t count)
+{
+    int val;
+    if (kstrtoint(buf, 10, &val))
+        return -EINVAL;
+    if (val != 0 && val != 1)
+        return -EINVAL;
+
+    global_pwm_enable = val;
+
+    // Set all fans to auto or manual
+    for (int i = 0; i < MAX_FANS; ++i) {
+        if (val == 0) {
+            // Set to automatic
+            hp_wmi_fan_speed_max_set(0);
+            hp_wmi_fan_speed_reset();
+        }
+        // If manual, do nothing here; manual mode is set when writing to pwmX
+    }
+    return count;
+}
+
+static DEVICE_ATTR_RW(pwm_enable);
+
+static struct attribute *hp_wmi_hwmon_attrs[] = {
+    &dev_attr_pwm_enable.attr,
+    NULL,
+};
+static const struct attribute_group hp_wmi_hwmon_attr_group = {
+    .attrs = hp_wmi_hwmon_attrs,
+};
 
 static struct attribute *hp_wmi_attrs[] = {
 	&dev_attr_display.attr,
@@ -1284,7 +1319,7 @@ static int __init hp_wmi_rfkill2_setup(struct platform_device *device)
 	return 0;
 fail:
 	for (; rfkill2_count > 0; rfkill2_count--) {
-		rfkill_unregister(rfkill2[rfkill2_count - 1].rfkill);
+		rfkill_unregister(rfkill2[rfkill2_count - 1].rfkill
 		rfkill_destroy(rfkill2[rfkill2_count - 1].rfkill);
 	}
 	return err;
@@ -2145,92 +2180,77 @@ static umode_t hp_wmi_hwmon_is_visible(const void *data,
 }
 
 static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
-			     u32 attr, int channel, long *val)
+                             u32 attr, int channel, long *val)
 {
-	int ret;
+    int ret;
+    switch (type) {
+    case hwmon_fan:
+        if (is_victus_s_thermal_profile())
+            ret = hp_wmi_get_fan_speed_victus_s(channel);
+        else
+            ret = hp_wmi_get_fan_speed(channel);
+        if (ret < 0)
+            return ret;
+        *val = ret;
+        return 0;
+    case hwmon_pwm:
+        // Return the last set RPM value (if you track it), or current RPM
+        if (is_victus_s_thermal_profile())
+            ret = hp_wmi_get_fan_speed_victus_s(channel);
+        else
+            ret = hp_wmi_get_fan_speed(channel);
+        if (ret < 0)
+            return ret;
+        *val = ret;
+        return 0;
+    default:
+        return -EINVAL;
+    }
 
-	switch (type) {
-	case hwmon_fan:
-		if (is_victus_s_thermal_profile())
-			ret = hp_wmi_get_fan_speed_victus_s(channel);
-		else
-			ret = hp_wmi_get_fan_speed(channel);
-		if (ret < 0)
-			return ret;
-		*val = ret;
-		return 0;
-	case hwmon_pwm:
-		switch (hp_wmi_fan_speed_max_get()) {
-		case 0:
-			/* 0 is automatic fan, which is 2 for hwmon */
-			*val = 2;
-			return 0;
-		case 1:
-			/* 1 is max fan, which is 0
-			  (no fan speed control) for hwmon
-			 */
-			*val = 0;
-			return 0;
-		default:
-			/* shouldn't happen */
-			return -ENODATA;
-		}
-	default:
-		return -EINVAL;
-	}
-}
 
-static int hp_wmi_fan_speed_manual_set(int fan, int percent)
+static int hp_wmi_fan_speed_manual_set(int fan, int rpm_div_100)
 {
     u8 fan_speed[2];
 
-    // Clamp percent to 1–100
-    if (percent < 1)
-        percent = 1;
-    if (percent > 100)
-        percent = 100;
+    // Clamp to valid range if needed (e.g., 1 to max_rpm/100)
+    if (rpm_div_100 < 1)
+        rpm_div_100 = 1;
+    // Optionally clamp to max_rpm/100 here
 
     fan_speed[0] = fan;
-    fan_speed[1] = percent;
+    fan_speed[1] = rpm_div_100;
 
     return hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
                    &fan_speed, sizeof(fan_speed), 0);
 }
 
 static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
-                  u32 attr, int channel, long val)
+                              u32 attr, int channel, long val)
 {
     switch (type) {
     case hwmon_pwm:
-        // Legacy mode: 0=auto, 2=max, 1=manual
-        if (val == 0) {
-            if (is_victus_s_thermal_profile()) {
-                hp_wmi_get_fan_count_userdefine_trigger();
-                return hp_wmi_fan_speed_max_reset();
-            } else {
-                return hp_wmi_fan_speed_max_set(0);
-            }
-        } else if (val == 2) {
-            return hp_wmi_fan_speed_max_set(1);
-        } else if (val == 1) {
-            // Legacy manual mode: set to 50% as example
-            return hp_wmi_fan_speed_manual_set(channel, 50);
+        if (global_pwm_enable == 0) {
+            // Only allow manual writes if in manual mode
+            return -EPERM;
         }
-        // Modern mode: 1–100 = manual percent
-        else if (val >= 1 && val <= 100) {
-            return hp_wmi_fan_speed_manual_set(channel, val);
-        } else {
+        // Clamp to max RPM
+        int max_rpm = hp_wmi_max_fan_rpm[channel];
+        if (max_rpm <= 0)
             return -EINVAL;
-        }
+        if (val < 0)
+            val = 0;
+        if (val > max_rpm)
+            val = max_rpm;
+        // Convert RPM to firmware value (divide by 100)
+        return hp_wmi_fan_speed_manual_set(channel, val / 100);
     default:
         return -EOPNOTSUPP;
     }
 }
 
-
 static const struct hwmon_channel_info * const info[] = {
     HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
-    HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT | HWMON_PWM_ENABLE, HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+    HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT, HWMON_PWM_INPUT),
     NULL
 };
 
@@ -2261,105 +2281,123 @@ static int hp_wmi_hwmon_init(void)
 	return 0;
 }
 
-static int __init hp_wmi_init(void)
+static int __init hp_wmi_bios_setup(struct platform_device *device)
 {
-	int event_capable = wmi_has_guid(HPWMI_EVENT_GUID);
-	int bios_capable = wmi_has_guid(HPWMI_BIOS_GUID);
-	int err, tmp = 0;
+	int err;
+	/* clear detected rfkill devices */
+	wifi_rfkill = NULL;
+	bluetooth_rfkill = NULL;
+	wwan_rfkill = NULL;
+	rfkill2_count = 0;
 
-	if (!bios_capable && !event_capable)
-		return -ENODEV;
-
-	if (hp_wmi_perform_query(HPWMI_HARDWARE_QUERY, HPWMI_READ, &tmp,
-				 sizeof(tmp), sizeof(tmp)) == HPWMI_RET_INVALID_PARAMETERS)
-		zero_insize_support = true;
-
-	if (event_capable) {
-		err = hp_wmi_input_setup();
-		if (err)
-			return err;
+	/*
+	 * In pre-2009 BIOS, command 1Bh return 0x4 to indicate that
+	 * BIOS no longer controls the power for the wireless
+	 * devices. All features supported by this command will no
+	 * longer be supported.
+	 */
+	if (!hp_wmi_bios_2009_later()) {
+		if (hp_wmi_rfkill_setup(device))
+			hp_wmi_rfkill2_setup(device);
 	}
 
-	if (bios_capable) {
-		hp_wmi_platform_dev =
-			platform_device_register_simple("hp-wmi", PLATFORM_DEVID_NONE, NULL, 0);
-		if (IS_ERR(hp_wmi_platform_dev)) {
-			err = PTR_ERR(hp_wmi_platform_dev);
-			goto err_destroy_input;
-		}
+	err = hp_wmi_hwmon_init();
 
-		err = platform_driver_probe(&hp_wmi_driver, hp_wmi_bios_setup);
-		if (err)
-			goto err_unregister_device;
-	}
+	if (err < 0)
+		return err;
 
-	if (is_omen_thermal_profile() || is_victus_thermal_profile()) {
-		err = omen_register_powersource_event_handler();
-		if (err)
-			goto err_unregister_device;
-	} else if (is_victus_s_thermal_profile()) {
-		err = victus_s_register_powersource_event_handler();
-		if (err)
-			goto err_unregister_device;
-	}
+	thermal_profile_setup(device);
 
 	return 0;
-
-err_unregister_device:
-	platform_device_unregister(hp_wmi_platform_dev);
-err_destroy_input:
-	if (event_capable)
-		hp_wmi_input_destroy();
-
-	return err;
 }
-module_init(hp_wmi_init);
 
-static void __exit hp_wmi_exit(void)
+static void __exit hp_wmi_bios_remove(struct platform_device *device)
 {
-	if (is_omen_thermal_profile() || is_victus_thermal_profile())
-		omen_unregister_powersource_event_handler();
-		 
+	int i;
 
-	if (is_victus_s_thermal_profile())
-		victus_s_unregister_powersource_event_handler();
+	for (i = 0; i < rfkill2_count; i++) {
+		rfkill_unregister(rfkill2[i].rfkill);
+		rfkill_destroy(rfkill2[i].rfkill);
+	}
 
-	if (wmi_has_guid(HPWMI_EVENT_GUID))
-		hp_wmi_input_destroy();
-
-	if (camera_shutter_input_dev)
-		input_unregister_device(camera_shutter_input_dev);
-
-	if (hp_wmi_platform_dev) {
-		platform_device_unregister(hp_wmi_platform_dev);
-		platform_driver_unregister(&hp_wmi_driver);
+	if (wifi_rfkill) {
+		rfkill_unregister(wifi_rfkill);
+		rfkill_destroy(wifi_rfkill);
+	}
+	if (bluetooth_rfkill) {
+		rfkill_unregister(bluetooth_rfkill);
+		rfkill_destroy(bluetooth_rfkill);
+	}
+	if (wwan_rfkill) {
+		rfkill_unregister(wwan_rfkill);
+		rfkill_destroy(wwan_rfkill);
 	}
 }
-module_exit(hp_wmi_exit);
 
-static int omen_set_cpu_power(const struct omen_power_profile *p)
+static int hp_wmi_resume_handler(struct device *device)
 {
-    struct victus_power_limits pl = {
-        .pl1 = p->cpu_pl1,
-        .pl2 = p->cpu_pl2,
-        .pl4 = p->cpu_pl4,
-        .cpu_gpu_concurrent_limit = p->cpu_combined,
-    };
-    return hp_wmi_perform_query(HPWMI_SET_POWER_LIMITS_QUERY, HPWMI_GM,
-                   &pl, sizeof(pl), 0);
+	/*
+	 * Hardware state may have changed while suspended, so trigger
+	 * input events for the current state. As this is a switch,
+	 * the input layer will only actually pass it on if the state
+	 * changed.
+	 */
+	if (hp_wmi_input_dev) {
+		if (test_bit(SW_DOCK, hp_wmi_input_dev->swbit))
+			input_report_switch(hp_wmi_input_dev, SW_DOCK,
+					    hp_wmi_get_dock_state());
+		if (test_bit(SW_TABLET_MODE, hp_wmi_input_dev->swbit))
+			input_report_switch(hp_wmi_input_dev, SW_TABLET_MODE,
+					    hp_wmi_get_tablet_mode());
+		input_sync(hp_wmi_input_dev);
+	}
+
+	if (rfkill2_count)
+		hp_wmi_rfkill2_refresh();
+
+	if (wifi_rfkill)
+		rfkill_set_states(wifi_rfkill,
+				  hp_wmi_get_sw_state(HPWMI_WIFI),
+				  hp_wmi_get_hw_state(HPWMI_WIFI));
+	if (bluetooth_rfkill)
+		rfkill_set_states(bluetooth_rfkill,
+				  hp_wmi_get_sw_state(HPWMI_BLUETOOTH),
+				  hp_wmi_get_hw_state(HPWMI_BLUETOOTH));
+	if (wwan_rfkill)
+		rfkill_set_states(wwan_rfkill,
+				  hp_wmi_get_sw_state(HPWMI_WWAN),
+				  hp_wmi_get_hw_state(HPWMI_WWAN));
+
+	return 0;
 }
 
-static int omen_set_gpu_power(const struct omen_power_profile *p)
-{
-    struct victus_gpu_power_modes gp = {
-        .ctgp_enable = p->gpu_ctgp,
-        .ppab_enable = p->gpu_ppab,
-        .dstate = p->gpu_dstate,
-        .gpu_slowdown_temp = p->gpu_peak_temp,
-    };
-    return hp_wmi_perform_query(HPWMI_SET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
-                   &gp, sizeof(gp), 0);
-}
+static const struct dev_pm_ops hp_wmi_pm_ops = {
+	.resume  = hp_wmi_resume_handler,
+	.restore  = hp_wmi_resume_handler,
+};
 
-#define MAX_FANS 2
-static int hp_wmi_max_fan_rpm[MAX_FANS] = {0, 0};
+/*
+ * hp_wmi_bios_remove() lives in .exit.text. For drivers registered via
+ * module_platform_driver_probe() this is ok because they cannot get unbound at
+ * runtime. So mark the driver struct with __refdata to prevent modpost
+ * triggering a section mismatch warning.
+ */
+static struct platform_driver hp_wmi_driver __refdata = {
+	.driver = {
+		.name = "hp-wmi",
+		.pm = &hp_wmi_pm_ops,
+		.dev_groups = hp_wmi_groups,
+	},
+	.remove = __exit_p(hp_wmi_bios_remove),
+};
+
+static umode_t hp_wmi_hwmon_is_visible(const void *data,
+                       enum hwmon_sensor_types type,
+                       u32 attr, int channel)
+{
+    switch (type) {
+    case hwmon_pwm:
+        return 0644;
+    case hwmon_fan:
+        if (is_victus_s_thermal_profile()) {
+            if (hp_wmi_get_fan_speed_victus_s(channel) >=
