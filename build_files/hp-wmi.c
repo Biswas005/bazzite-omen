@@ -54,6 +54,9 @@ MODULE_ALIAS("wmi:5FB7F034-2C63-45E9-BE91-3D44E2C707E4");
 
 #define zero_if_sup(tmp) (zero_insize_support?0:sizeof(tmp)) // use when zero insize is required
 
+#define MAX_FANS 2
+static int hp_wmi_max_fan_rpm[MAX_FANS] = {0, 0};
+
 /* DMI board names of devices that should use the omen specific path for
  * thermal profiles.
  * This was obtained by taking a look in the windows omen command center
@@ -955,6 +958,13 @@ static const struct attribute_group hp_wmi_hwmon_attr_group = {
     .attrs = hp_wmi_hwmon_attrs,
 };
 
+DEVICE_ATTR_RO(display);
+DEVICE_ATTR_RO(hddtemp);
+DEVICE_ATTR_RW(als);
+DEVICE_ATTR_RO(dock);
+DEVICE_ATTR_RO(tablet);
+DEVICE_ATTR_RW(postcode);
+
 static struct attribute *hp_wmi_attrs[] = {
 	&dev_attr_display.attr,
 	&dev_attr_hddtemp.attr,
@@ -1319,10 +1329,8 @@ static int __init hp_wmi_rfkill2_setup(struct platform_device *device)
 	return 0;
 fail:
 	for (; rfkill2_count > 0; rfkill2_count--) {
-		rfkill_unregister(rfkill2[rfkill2_count - 1].rfkill
-		rfkill_destroy(rfkill2[rfkill2_count - 1].rfkill);
-	}
-	return err;
+    rfkill_unregister(rfkill2[rfkill2_count - 1].rfkill);
+    rfkill_destroy(rfkill2[rfkill2_count - 1].rfkill);
 }
 
 /* OMEN power/fan profile table */
