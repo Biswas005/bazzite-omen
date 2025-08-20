@@ -2168,7 +2168,7 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 			return 0;
 		case 1:
 			/* 1 is max fan, which is 0
-			 * (no fan speed control) for hwmon
+			  (no fan speed control) for hwmon
 			 */
 			*val = 0;
 			return 0;
