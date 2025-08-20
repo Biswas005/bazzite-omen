@@ -2392,3 +2392,4 @@ static void hp_wmi_init_max_fan_rpm(void)
         if (rpm > 0)
             hp_wmi_max_fan_rpm[i] = rpm;
     }
+}
