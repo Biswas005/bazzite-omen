@@ -2197,40 +2197,60 @@ static int hp_wmi_fan_speed_manual_set(int fan, int percent)
                    &fan_speed, sizeof(fan_speed), 0);
 }
 
+static int hp_wmi_fan_speed_manual_set_percent(int percent)
+{
+    u8 fan_speed[MAX_FANS * 2];
+    int i;
+
+    for (i = 0; i < MAX_FANS; i++) {
+        int max_rpm = hp_wmi_max_fan_rpm[i];
+        if (max_rpm <= 0)
+            continue;
+        int rpm = (percent * max_rpm) / 100;
+        if (rpm < 0) rpm = 0;
+        if (rpm > max_rpm) rpm = max_rpm;
+        fan_speed[i * 2] = i;
+        fan_speed[i * 2 + 1] = rpm / 100;
+    }
+    return hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
+                   &fan_speed, sizeof(fan_speed), 0);
+}
+
 static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
                   u32 attr, int channel, long val)
 {
-    switch (type) {
-    case hwmon_pwm:
-        // Legacy mode: 0=auto, 2=max, 1=manual
-        if (val == 0) {
-            if (is_victus_s_thermal_profile()) {
-                hp_wmi_get_fan_count_userdefine_trigger();
-                return hp_wmi_fan_speed_max_reset();
-            } else {
+    static int pwm_mode = 0; // 0=auto, 1=manual, 2=max
+
+    if (type == hwmon_pwm) {
+        if (attr == HWMON_PWM_ENABLE) {
+            switch (val) {
+            case 0: // auto
+                pwm_mode = 0;
                 return hp_wmi_fan_speed_max_set(0);
+            case 1: // manual
+                pwm_mode = 1;
+                return 0;
+            case 2: // max
+                pwm_mode = 2;
+                return hp_wmi_fan_speed_max_set(1);
+            default:
+                return -EINVAL;
             }
-        } else if (val == 2) {
-            return hp_wmi_fan_speed_max_set(1);
-        } else if (val == 1) {
-            // Legacy manual mode: set to 50% as example
-            return hp_wmi_fan_speed_manual_set(channel, 50);
+        } else if (attr == HWMON_PWM_INPUT) {
+            if (pwm_mode != 1)
+                return -EPERM;
+            if (val < 1 || val > 100)
+                return -EINVAL;
+            return hp_wmi_fan_speed_manual_set_percent(val);
         }
-        // Modern mode: 1–100 = manual percent
-        else if (val >= 1 && val <= 100) {
-            return hp_wmi_fan_speed_manual_set(channel, val);
-        } else {
-            return -EINVAL;
-        }
-    default:
-        return -EOPNOTSUPP;
     }
+    return -EOPNOTSUPP;
 }
 
 
 static const struct hwmon_channel_info * const info[] = {
     HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
-    HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT | HWMON_PWM_ENABLE, HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+    HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
     NULL
 };
 
@@ -2363,3 +2383,13 @@ static int omen_set_gpu_power(const struct omen_power_profile *p)
 
 #define MAX_FANS 2
 static int hp_wmi_max_fan_rpm[MAX_FANS] = {0, 0};
+
+static void hp_wmi_init_max_fan_rpm(void)
+{
+    for (int i = 0; i < MAX_FANS; i++) {
+        int rpm = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_GET_QUERY, HPWMI_GM,
+                           &i, sizeof(i), sizeof(rpm));
+        if (rpm > 0)
+            hp_wmi_max_fan_rpm[i] = rpm;
+    }
+a
