@@ -157,20 +157,6 @@ enum hp_wmi_commandtype {
 	HPWMI_THERMAL_PROFILE_QUERY	= 0x4c,
 };
 
-struct omen_power_limits {
-    u8 pl1;
-    u8 pl2;
-    u8 pl4;
-    u8 cpu_gpu_concurrent_limit;
-};
-
-struct omen_gpu_power_modes {
-    u8 ctgp_enable;
-    u8 ppab_enable;
-    u8 dstate;
-    u8 gpu_slowdown_temp;
-};
-
 struct victus_power_limits {
 	u8 pl1;
 	u8 pl2;
@@ -327,6 +313,7 @@ static struct notifier_block platform_power_source_nb;
 static enum platform_profile_option active_platform_profile;
 static bool platform_profile_support;
 static bool zero_insize_support;
+
 
 static struct rfkill *wifi_rfkill;
 static struct rfkill *bluetooth_rfkill;
@@ -1311,11 +1298,11 @@ struct omen_power_profile {
 
 static const struct omen_power_profile omen_profiles[] = {
     // Cool
-    { 28, 30, 35,  40,   0, 1, 3, 75},
+    { 28, 30, 35,  40,   0, 0, 0, 75},
     // Balanced
-    { 45, 50, 100, 0,   0, 1, 2, 80},
+    { 35, 40, 65, 0,   1, 0, 0, 80},
     // Performance (max everything)
-    { 65, 65, 120, 0,   1, 1, 1, 87},
+    { 65, 65, 100, 0,   1, 1, 1, 87},
 };
 
 static int platform_profile_omen_get_ec(enum platform_profile_option *profile)
@@ -1425,12 +1412,11 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
     if (err < 0)
         return err;
 
-    // Set power/fan profile
+    
     if (opp) {
         omen_set_gpu_power(opp);
         omen_set_cpu_power(opp);
-        // Optionally: implement fan curve logic here if supported by firmware
-		// start_fan_mode_watcher();
+        
 	} else {
 		pr_err("No power profile found for the selected thermal profile\n");
 		return -EINVAL;
@@ -2313,7 +2299,7 @@ static void __exit hp_wmi_exit(void)
 {
 	if (is_omen_thermal_profile() || is_victus_thermal_profile())
 		omen_unregister_powersource_event_handler();
-		 stop_fan_mode_watcher();
+		 
 
 	if (is_victus_s_thermal_profile())
 		victus_s_unregister_powersource_event_handler();
@@ -2333,41 +2319,24 @@ module_exit(hp_wmi_exit);
 
 static int omen_set_cpu_power(const struct omen_power_profile *p)
 {
-    struct omen_power_limits pl = {
+    struct victus_power_limits pl = {
         .pl1 = p->cpu_pl1,
         .pl2 = p->cpu_pl2,
         .pl4 = p->cpu_pl4,
         .cpu_gpu_concurrent_limit = p->cpu_combined,
     };
-
-    // Check for NO_CHANGE
-    if (pl.pl1 == HP_POWER_LIMIT_NO_CHANGE || pl.pl2 == HP_POWER_LIMIT_NO_CHANGE)
-        return -EINVAL;
-
-    // Ensure PL2 is not less than PL1
-    if (pl.pl2 < pl.pl1)
-        return -EINVAL;
-
     return hp_wmi_perform_query(HPWMI_SET_POWER_LIMITS_QUERY, HPWMI_GM,
                    &pl, sizeof(pl), 0);
 }
 
-static int omen_set_power_modes(u8 ctgp_enable, u8 ppab_enable, u8 dstate)
+static int omen_set_gpu_power(const struct omen_power_profile *p)
 {
-    struct omen_gpu_power_modes current, gp;
-    int ret;
-
-    // Get current GPU slowdown temp to preserve it
-    ret = hp_wmi_perform_query(HPWMI_GET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
-                              &current, sizeof(current), sizeof(current));
-    if (ret < 0)
-        return ret;
-
-    gp.ctgp_enable = ctgp_enable;
-    gp.ppab_enable = ppab_enable;
-    gp.dstate = dstate;
-    gp.gpu_slowdown_temp = current.gpu_slowdown_temp; // preserve slowdown temp
-
+    struct victus_gpu_power_modes gp = {
+        .ctgp_enable = p->gpu_ctgp,
+        .ppab_enable = p->gpu_ppab,
+        .dstate = p->gpu_dstate,
+        .gpu_slowdown_temp = p->gpu_peak_temp,
+    };
     return hp_wmi_perform_query(HPWMI_SET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
-                               &gp, sizeof(gp), 0);
+                   &gp, sizeof(gp), 0);
 }
