@@ -2167,7 +2167,7 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 			*val = 2;
 			return 0;
 		case 1:
-			
+			/* 1 is max fan, which is 0
 			 * (no fan speed control) for hwmon
 			 */
 			*val = 0;
@@ -2181,26 +2181,40 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	}
 }
 
+static int hp_wmi_fan_speed_manual_set(int fan, int percent)
+{
+    u8 fan_speed[2];
+
+    // Clamp percent to 1–100
+    if (percent < 1)
+        percent = 1;
+    if (percent > 100)
+        percent = 100;
+
+    fan_speed[0] = fan;
+    fan_speed[1] = percent;
+
+    return hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
+                   &fan_speed, sizeof(fan_speed), 0);
+}
+
 static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
 			      u32 attr, int channel, long val)
 {
 	switch (type) {
 	case hwmon_pwm:
-		switch (val) {
-		case 0:
-			if (is_victus_s_thermal_profile())
-				hp_wmi_get_fan_count_userdefine_trigger();
-			/* 0 is no fan speed control (max), which is 1 for us */
-			return hp_wmi_fan_speed_max_set(1);
-		case 2:
-			/* 2 is automatic speed control, which is 0 for us */
+		if (val == 0) {
+			// 0 = automatic
 			if (is_victus_s_thermal_profile()) {
 				hp_wmi_get_fan_count_userdefine_trigger();
 				return hp_wmi_fan_speed_max_reset();
-			} else
+			} else {
 				return hp_wmi_fan_speed_max_set(0);
-		default:
-			/* we don't support manual fan speed control */
+			}
+		} else if (val >= 1 && val <= 100) {
+			// 1-100 = manual percent (100 = max)
+			return hp_wmi_fan_speed_manual_set(channel, val);
+		} else {
 			return -EINVAL;
 		}
 	default:
