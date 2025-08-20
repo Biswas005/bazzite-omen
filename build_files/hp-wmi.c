@@ -1290,7 +1290,7 @@ fail:
 	return err;
 }
 
-// OMEN power/fan profile table
+/* OMEN power/fan profile table */
 struct omen_power_profile {
     u8 cpu_pl1, cpu_pl2, cpu_pl4, cpu_combined;
     u8 gpu_ctgp, gpu_ppab, gpu_dstate, gpu_peak_temp;
@@ -2123,26 +2123,25 @@ static struct platform_driver hp_wmi_driver __refdata = {
 };
 
 static umode_t hp_wmi_hwmon_is_visible(const void *data,
-				       enum hwmon_sensor_types type,
-				       u32 attr, int channel)
+                       enum hwmon_sensor_types type,
+                       u32 attr, int channel)
 {
-	switch (type) {
-	case hwmon_pwm:
-		return 0644;
-	case hwmon_fan:
-		if (is_victus_s_thermal_profile()) {
-			if (hp_wmi_get_fan_speed_victus_s(channel) >= 0)
-				return 0444;
-		} else {
-			if (hp_wmi_get_fan_speed(channel) >= 0)
-				return 0444;
-		}
-		break;
-	default:
-		return 0;
-	}
-
-	return 0;
+    switch (type) {
+    case hwmon_pwm:
+        return 0644;
+    case hwmon_fan:
+        if (is_victus_s_thermal_profile()) {
+            if (hp_wmi_get_fan_speed_victus_s(channel) >= 0)
+                return 0444;
+        } else {
+            if (hp_wmi_get_fan_speed(channel) >= 0)
+                return 0444;
+        }
+        break;
+    default:
+        return 0;
+    }
+    return 0;
 }
 
 static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
@@ -2199,33 +2198,40 @@ static int hp_wmi_fan_speed_manual_set(int fan, int percent)
 }
 
 static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
-			      u32 attr, int channel, long val)
+                  u32 attr, int channel, long val)
 {
-	switch (type) {
-	case hwmon_pwm:
-		if (val == 0) {
-			// 0 = automatic
-			if (is_victus_s_thermal_profile()) {
-				hp_wmi_get_fan_count_userdefine_trigger();
-				return hp_wmi_fan_speed_max_reset();
-			} else {
-				return hp_wmi_fan_speed_max_set(0);
-			}
-		} else if (val >= 1 && val <= 100) {
-			// 1-100 = manual percent (100 = max)
-			return hp_wmi_fan_speed_manual_set(channel, val);
-		} else {
-			return -EINVAL;
-		}
-	default:
-		return -EOPNOTSUPP;
-	}
+    switch (type) {
+    case hwmon_pwm:
+        // Legacy mode: 0=auto, 2=max, 1=manual
+        if (val == 0) {
+            if (is_victus_s_thermal_profile()) {
+                hp_wmi_get_fan_count_userdefine_trigger();
+                return hp_wmi_fan_speed_max_reset();
+            } else {
+                return hp_wmi_fan_speed_max_set(0);
+            }
+        } else if (val == 2) {
+            return hp_wmi_fan_speed_max_set(1);
+        } else if (val == 1) {
+            // Legacy manual mode: set to 50% as example
+            return hp_wmi_fan_speed_manual_set(channel, 50);
+        }
+        // Modern mode: 1–100 = manual percent
+        else if (val >= 1 && val <= 100) {
+            return hp_wmi_fan_speed_manual_set(channel, val);
+        } else {
+            return -EINVAL;
+        }
+    default:
+        return -EOPNOTSUPP;
+    }
 }
 
+
 static const struct hwmon_channel_info * const info[] = {
-	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
-	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_ENABLE),
-	NULL
+    HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
+    HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT | HWMON_PWM_ENABLE, HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+    NULL
 };
 
 static const struct hwmon_ops ops = {
@@ -2354,3 +2360,6 @@ static int omen_set_gpu_power(const struct omen_power_profile *p)
     return hp_wmi_perform_query(HPWMI_SET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
                    &gp, sizeof(gp), 0);
 }
+
+#define MAX_FANS 2
+static int hp_wmi_max_fan_rpm[MAX_FANS] = {0, 0};
