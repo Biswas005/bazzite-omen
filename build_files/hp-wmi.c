@@ -30,6 +30,7 @@
 #include <linux/rfkill.h>
 #include <linux/string.h>
 #include <linux/dmi.h>
+#include <linux/workqueue.h>
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
 MODULE_DESCRIPTION("HP laptop WMI driver");
@@ -154,6 +155,20 @@ enum hp_wmi_commandtype {
 	HPWMI_POSTCODEERROR_QUERY	= 0x2a,
 	HPWMI_SYSTEM_DEVICE_MODE	= 0x40,
 	HPWMI_THERMAL_PROFILE_QUERY	= 0x4c,
+};
+
+struct omen_power_limits {
+    u8 pl1;
+    u8 pl2;
+    u8 pl4;
+    u8 cpu_gpu_concurrent_limit;
+};
+
+struct omen_gpu_power_modes {
+    u8 ctgp_enable;
+    u8 ppab_enable;
+    u8 dstate;
+    u8 gpu_slowdown_temp;
 };
 
 struct victus_power_limits {
@@ -1288,6 +1303,21 @@ fail:
 	return err;
 }
 
+// OMEN power/fan profile table
+struct omen_power_profile {
+    u8 cpu_pl1, cpu_pl2, cpu_pl4, cpu_combined;
+    u8 gpu_ctgp, gpu_ppab, gpu_dstate, gpu_peak_temp;
+};
+
+static const struct omen_power_profile omen_profiles[] = {
+    // Cool
+    { 28, 30, 35,  40,   0, 1, 0, 75},
+    // Balanced
+    { 45, 50, 100, 0,   1, 1, 0, 80},
+    // Performance (max everything)
+    { 64, 65, 120, 0,   1, 1, 1, 87},
+};
+
 static int platform_profile_omen_get_ec(enum platform_profile_option *profile)
 {
 	int tp;
@@ -1359,58 +1389,68 @@ inline int omen_thermal_profile_ec_timer_set(u8 value)
 	return ec_write(HP_OMEN_EC_THERMAL_PROFILE_TIMER_OFFSET, value);
 }
 
+static int omen_set_cpu_power(const struct omen_power_profile *p);
+static int omen_set_gpu_power(const struct omen_power_profile *p);
+
 static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 {
-	int err, tp, tp_version;
-	enum hp_thermal_profile_omen_flags flags = 0;
+    int err, tp, tp_version;
+    enum hp_thermal_profile_omen_flags flags = 0;
+    const struct omen_power_profile *opp = NULL;
 
-	tp_version = omen_get_thermal_policy_version();
+    tp_version = omen_get_thermal_policy_version();
 
-	if (tp_version < 0 || tp_version > 1)
-		return -EOPNOTSUPP;
+    if (tp_version < 0 || tp_version > 1)
+        return -EOPNOTSUPP;
 
-	switch (profile) {
-	case PLATFORM_PROFILE_PERFORMANCE:
-		if (tp_version == 0)
-			tp = HP_OMEN_V0_THERMAL_PROFILE_PERFORMANCE;
-		else
-			tp = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE;
-		break;
-	case PLATFORM_PROFILE_BALANCED:
-		if (tp_version == 0)
-			tp = HP_OMEN_V0_THERMAL_PROFILE_DEFAULT;
-		else
-			tp = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT;
-		break;
-	case PLATFORM_PROFILE_COOL:
-		if (tp_version == 0)
-			tp = HP_OMEN_V0_THERMAL_PROFILE_COOL;
-		else
-			tp = HP_OMEN_V1_THERMAL_PROFILE_COOL;
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
+    switch (profile) {
+    case PLATFORM_PROFILE_PERFORMANCE:
+        opp = &omen_profiles[2];
+        tp = (tp_version == 0) ? HP_OMEN_V0_THERMAL_PROFILE_PERFORMANCE : HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE;
+        break;
+    case PLATFORM_PROFILE_BALANCED:
+        opp = &omen_profiles[1];
+        tp = (tp_version == 0) ? HP_OMEN_V0_THERMAL_PROFILE_DEFAULT : HP_OMEN_V1_THERMAL_PROFILE_DEFAULT;
+        break;
+    case PLATFORM_PROFILE_COOL:
+        opp = &omen_profiles[0];
+        tp = (tp_version == 0) ? HP_OMEN_V0_THERMAL_PROFILE_COOL : HP_OMEN_V1_THERMAL_PROFILE_COOL;
+        break;
+    default:
+        return -EOPNOTSUPP;
+    }
 
-	err = omen_thermal_profile_set(tp);
-	if (err < 0)
-		return err;
+    // Set thermal profile as before
+    err = omen_thermal_profile_set(tp);
+    if (err < 0)
+        return err;
 
-	if (has_omen_thermal_profile_ec_timer()) {
-		err = omen_thermal_profile_ec_timer_set(0);
-		if (err < 0)
-			return err;
+    // Set power/fan profile
+    if (opp) {
+        omen_set_gpu_power(opp);
+        omen_set_cpu_power(opp);
+        // Optionally: implement fan curve logic here if supported by firmware
+		// start_fan_mode_watcher();
+	} else {
+		pr_err("No power profile found for the selected thermal profile\n");
+		return -EINVAL;
+    }
 
-		if (profile == PLATFORM_PROFILE_PERFORMANCE)
-			flags = HP_OMEN_EC_FLAGS_NOTIMER |
-				HP_OMEN_EC_FLAGS_TURBO;
+    if (has_omen_thermal_profile_ec_timer()) {
+        err = omen_thermal_profile_ec_timer_set(0);
+        if (err < 0)
+            return err;
 
-		err = omen_thermal_profile_ec_flags_set(flags);
-		if (err < 0)
-			return err;
-	}
+        if (profile == PLATFORM_PROFILE_PERFORMANCE)
+            flags = HP_OMEN_EC_FLAGS_NOTIMER |
+                HP_OMEN_EC_FLAGS_TURBO;
 
-	return 0;
+        err = omen_thermal_profile_ec_flags_set(flags);
+        if (err < 0)
+            return err;
+    }
+
+    return 0;
 }
 
 static int platform_profile_omen_set(struct device *dev,
@@ -2273,6 +2313,7 @@ static void __exit hp_wmi_exit(void)
 {
 	if (is_omen_thermal_profile() || is_victus_thermal_profile())
 		omen_unregister_powersource_event_handler();
+		 stop_fan_mode_watcher();
 
 	if (is_victus_s_thermal_profile())
 		victus_s_unregister_powersource_event_handler();
@@ -2289,3 +2330,44 @@ static void __exit hp_wmi_exit(void)
 	}
 }
 module_exit(hp_wmi_exit);
+
+static int omen_set_cpu_power(const struct omen_power_profile *p)
+{
+    struct omen_power_limits pl = {
+        .pl1 = p->cpu_pl1,
+        .pl2 = p->cpu_pl2,
+        .pl4 = p->cpu_pl4,
+        .cpu_gpu_concurrent_limit = p->cpu_combined,
+    };
+
+    // Check for NO_CHANGE
+    if (pl.pl1 == HP_POWER_LIMIT_NO_CHANGE || pl.pl2 == HP_POWER_LIMIT_NO_CHANGE)
+        return -EINVAL;
+
+    // Ensure PL2 is not less than PL1
+    if (pl.pl2 < pl.pl1)
+        return -EINVAL;
+
+    return hp_wmi_perform_query(HPWMI_SET_POWER_LIMITS_QUERY, HPWMI_GM,
+                   &pl, sizeof(pl), 0);
+}
+
+static int omen_set_power_modes(u8 ctgp_enable, u8 ppab_enable, u8 dstate)
+{
+    struct omen_gpu_power_modes current, gp;
+    int ret;
+
+    // Get current GPU slowdown temp to preserve it
+    ret = hp_wmi_perform_query(HPWMI_GET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
+                              &current, sizeof(current), sizeof(current));
+    if (ret < 0)
+        return ret;
+
+    gp.ctgp_enable = ctgp_enable;
+    gp.ppab_enable = ppab_enable;
+    gp.dstate = dstate;
+    gp.gpu_slowdown_temp = current.gpu_slowdown_temp; // preserve slowdown temp
+
+    return hp_wmi_perform_query(HPWMI_SET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
+                               &gp, sizeof(gp), 0);
+}
