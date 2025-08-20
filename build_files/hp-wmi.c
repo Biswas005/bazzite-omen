@@ -52,6 +52,9 @@ MODULE_ALIAS("wmi:5FB7F034-2C63-45E9-BE91-3D44E2C707E4");
 
 #define ACPI_AC_CLASS "ac_adapter"
 
+#define MAX_FANS 2
+static int hp_wmi_max_fan_rpm[MAX_FANS] = {0, 0};
+
 #define zero_if_sup(tmp) (zero_insize_support?0:sizeof(tmp)) // use when zero insize is required
 
 /* DMI board names of devices that should use the omen specific path for
@@ -2381,9 +2384,6 @@ static int omen_set_gpu_power(const struct omen_power_profile *p)
                    &gp, sizeof(gp), 0);
 }
 
-#define MAX_FANS 2
-static int hp_wmi_max_fan_rpm[MAX_FANS] = {0, 0};
-
 static void hp_wmi_init_max_fan_rpm(void)
 {
     for (int i = 0; i < MAX_FANS; i++) {
@@ -2392,4 +2392,3 @@ static void hp_wmi_init_max_fan_rpm(void)
         if (rpm > 0)
             hp_wmi_max_fan_rpm[i] = rpm;
     }
-a
