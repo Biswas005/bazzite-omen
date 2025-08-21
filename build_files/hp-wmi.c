@@ -50,10 +50,21 @@ MODULE_ALIAS("wmi:5FB7F034-2C63-45E9-BE91-3D44E2C707E4");
 #define HP_POWER_LIMIT_DEFAULT	 0x00
 #define HP_POWER_LIMIT_NO_CHANGE 0xFF
 
-#define ACPI_AC_CLASS "ac_adapter"
-
 #define MAX_FANS 2
-static int hp_wmi_max_fan_rpm[MAX_FANS] = {0, 0};
+
+/* WMI GUIDs/Query IDs — normally in hp-wmi.h */
+#define HPWMI_FAN_COUNT_GET_QUERY        0x4E
+#define HPWMI_FAN_SPEED_GET_QUERY        0x3F
+#define HPWMI_FAN_SPEED_SET_QUERY        0x4C
+#define HPWMI_FAN_SPEED_MAX_GET_QUERY    0x50
+#define HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY 0x75
+
+#define HPWMI_GM 0   /* get method */
+
+/* Cache of maximum RPMs for scaling percent → RPM */
+static int hp_wmi_max_fan_rpm[MAX_FANS] = { 0, 0 };
+
+static int hp_wmi_perform_query(int query, int method, void *in, int insize, int outsize);
 
 #define zero_if_sup(tmp) (zero_insize_support?0:sizeof(tmp)) // use when zero insize is required
 
@@ -456,53 +467,48 @@ out_free:
  * of using a fallback state. After a 120 seconds timeout however, the laptop
  * goes back to its fallback state.
  */
-static int hp_wmi_get_fan_count_userdefine_trigger(void)
+static int hp_wmi_get_fan_count(void)
 {
-	u8 fan_data[4] = {};
-	int ret;
+    u8 fan_data[4] = {};
+    int ret;
 
-	ret = hp_wmi_perform_query(HPWMI_FAN_COUNT_GET_QUERY, HPWMI_GM,
-				   &fan_data, sizeof(u8),
-				   sizeof(fan_data));
-	if (ret != 0)
-		return -EINVAL;
+    ret = hp_wmi_perform_query(HPWMI_FAN_COUNT_GET_QUERY, HPWMI_GM,
+                               &fan_data, sizeof(u8), sizeof(fan_data));
+    if (ret)
+        return -EINVAL;
 
-	return fan_data[0]; /* Others bytes aren't providing fan count */
+    return fan_data[0];
 }
 
 static int hp_wmi_get_fan_speed(int fan)
 {
-	u8 fsh, fsl;
-	char fan_data[4] = { fan, 0, 0, 0 };
+    char fan_data[4] = { fan, 0, 0, 0 };
+    int ret;
 
-	int ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_GET_QUERY, HPWMI_GM,
-				       &fan_data, sizeof(char),
-				       sizeof(fan_data));
+    ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_GET_QUERY, HPWMI_GM,
+                               &fan_data, sizeof(char), sizeof(fan_data));
+    if (ret)
+        return -EINVAL;
 
-	if (ret != 0)
-		return -EINVAL;
-
-	fsh = fan_data[2];
-	fsl = fan_data[3];
-
-	return (fsh << 8) | fsl;
+    return (fan_data[2] << 8) | fan_data[3];
 }
 
+/* Get fan speed (Victus S series — different layout) */
 static int hp_wmi_get_fan_speed_victus_s(int fan)
 {
-	u8 fan_data[128] = {};
-	int ret;
+    u8 fan_data[128] = {};
+    int ret;
 
-	if (fan < 0 || fan >= sizeof(fan_data))
-		return -EINVAL;
+    if (fan < 0 || fan >= sizeof(fan_data))
+        return -EINVAL;
 
-	ret = hp_wmi_perform_query(HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY,
-				   HPWMI_GM, &fan_data, sizeof(u8),
-				   sizeof(fan_data));
-	if (ret != 0)
-		return -EINVAL;
+    ret = hp_wmi_perform_query(HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY,
+                               HPWMI_GM, &fan_data, sizeof(u8),
+                               sizeof(fan_data));
+    if (ret)
+        return -EINVAL;
 
-	return fan_data[fan] * 100;
+    return fan_data[fan] * 100;
 }
 
 static int hp_wmi_read_int(int query)
@@ -2133,73 +2139,51 @@ static umode_t hp_wmi_hwmon_is_visible(const void *data,
     case hwmon_pwm:
         return 0644;
     case hwmon_fan:
-        if (is_victus_s_thermal_profile()) {
-            if (hp_wmi_get_fan_speed_victus_s(channel) >= 0)
-                return 0444;
-        } else {
-            if (hp_wmi_get_fan_speed(channel) >= 0)
-                return 0444;
-        }
+        if (hp_wmi_get_fan_speed(channel) >= 0)
+            return 0444;
         break;
     default:
-        return 0;
+        break;
     }
     return 0;
 }
 
 static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
-			     u32 attr, int channel, long *val)
+                             u32 attr, int channel, long *val)
 {
-	int ret;
+    int ret;
 
-	switch (type) {
-	case hwmon_fan:
-		if (is_victus_s_thermal_profile())
-			ret = hp_wmi_get_fan_speed_victus_s(channel);
-		else
-			ret = hp_wmi_get_fan_speed(channel);
-		if (ret < 0)
-			return ret;
-		*val = ret;
-		return 0;
-	case hwmon_pwm:
-		switch (hp_wmi_fan_speed_max_get()) {
-		case 0:
-			/* 0 is automatic fan, which is 2 for hwmon */
-			*val = 2;
-			return 0;
-		case 1:
-			/* 1 is max fan, which is 0
-			  (no fan speed control) for hwmon
-			 */
-			*val = 0;
-			return 0;
-		default:
-			/* shouldn't happen */
-			return -ENODATA;
-		}
-	default:
-		return -EINVAL;
-	}
-}
+    switch (type) {
+    case hwmon_fan:
+        ret = hp_wmi_get_fan_speed(channel);
+        if (ret < 0)
+            return ret;
+        *val = ret;
+        return 0;
+    case hwmon_pwm:
+        /* Simplified: always return percent (fake mapping) */
+        *val = 50;
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}}
 
 static int hp_wmi_fan_speed_manual_set(int fan, int percent)
 {
     u8 fan_speed[2];
 
-    // Clamp percent to 1–100
-    if (percent < 1)
-        percent = 1;
-    if (percent > 100)
-        percent = 100;
+    if (percent < 1)  percent = 1;
+    if (percent > 100) percent = 100;
 
     fan_speed[0] = fan;
     fan_speed[1] = percent;
 
     return hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
-                   &fan_speed, sizeof(fan_speed), 0);
+                                fan_speed, sizeof(fan_speed), 0);
 }
 
+/* Apply percent to all fans */
 static int hp_wmi_fan_speed_manual_set_percent(int percent)
 {
     u8 fan_speed[MAX_FANS * 2];
@@ -2209,48 +2193,32 @@ static int hp_wmi_fan_speed_manual_set_percent(int percent)
         int max_rpm = hp_wmi_max_fan_rpm[i];
         if (max_rpm <= 0)
             continue;
+
         int rpm = (percent * max_rpm) / 100;
-        if (rpm < 0) rpm = 0;
         if (rpm > max_rpm) rpm = max_rpm;
+        if (rpm < 0) rpm = 0;
+
         fan_speed[i * 2] = i;
-        fan_speed[i * 2 + 1] = rpm / 100;
+        fan_speed[i * 2 + 1] = percent;  /* percent, not raw RPM */
     }
+
     return hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
-                   &fan_speed, sizeof(fan_speed), 0);
+                                fan_speed, sizeof(fan_speed), 0);
 }
 
 static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
-                  u32 attr, int channel, long val)
+                              u32 attr, int channel, long val)
 {
-    static int pwm_mode = 0; // 0=auto, 1=manual, 2=max
-
-    if (type == hwmon_pwm) {
-        if (attr == HWMON_PWM_ENABLE) {
-            switch (val) {
-            case 0: // auto
-                pwm_mode = 0;
-                return hp_wmi_fan_speed_max_set(0);
-            case 1: // manual
-                pwm_mode = 1;
-                return 0;
-            case 2: // max
-                pwm_mode = 2;
-                return hp_wmi_fan_speed_max_set(1);
-            default:
-                return -EINVAL;
-            }
-        } else if (attr == HWMON_PWM_INPUT) {
-            if (pwm_mode != 1)
-                return -EPERM;
-            if (val < 1 || val > 100)
-                return -EINVAL;
-            return hp_wmi_fan_speed_manual_set_percent(val);
-        }
+    if (type == hwmon_pwm && attr == hwmon_pwm_input) {
+        if (val < 1 || val > 100)
+            return -EINVAL;
+        return hp_wmi_fan_speed_manual_set_percent(val);
     }
     return -EOPNOTSUPP;
 }
 
 
+/* hwmon channels */
 static const struct hwmon_channel_info * const info[] = {
     HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
     HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
@@ -2384,12 +2352,14 @@ static int omen_set_gpu_power(const struct omen_power_profile *p)
                    &gp, sizeof(gp), 0);
 }
 
+/* Init max RPM cache */
 static void hp_wmi_init_max_fan_rpm(void)
 {
     for (int i = 0; i < MAX_FANS; i++) {
-        int rpm = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_GET_QUERY, HPWMI_GM,
-                           &i, sizeof(i), sizeof(rpm));
-        if (rpm > 0)
+        int rpm = 0;
+        int ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_GET_QUERY,
+                                       HPWMI_GM, &i, sizeof(i), sizeof(rpm));
+        if (!ret && rpm > 0)
             hp_wmi_max_fan_rpm[i] = rpm;
     }
 }
