@@ -171,6 +171,14 @@ struct victus_gpu_power_modes {
 	u8 gpu_slowdown_temp;
 };
 
+enum hp_wmi_keyboard_commandtype {
+    HPWMI_KEYBOARD_BACKLIGHT_SUPPORT_QUERY = 0x01,
+    HPWMI_KEYBOARD_COLOR_GET_QUERY = 0x02,
+    HPWMI_KEYBOARD_COLOR_SET_QUERY = 0x03,
+    HPWMI_KEYBOARD_BACKLIGHT_GET_QUERY = 0x04,
+    HPWMI_KEYBOARD_BACKLIGHT_SET_QUERY = 0x05,
+};
+
 enum hp_wmi_gm_commandtype {
 	HPWMI_FAN_SPEED_GET_QUERY		= 0x11,
 	HPWMI_SET_PERFORMANCE_MODE		= 0x1A,
@@ -233,6 +241,10 @@ enum hp_thermal_profile_omen_flags {
 	HP_OMEN_EC_FLAGS_TURBO		= 0x04,
 	HP_OMEN_EC_FLAGS_NOTIMER	= 0x02,
 	HP_OMEN_EC_FLAGS_JUSTSET	= 0x01,
+};
+
+enum hp_wmi_keyboard_command {
+    HPWMI_KEYBOARD_CMD = 0x20009,  // Keyboard control command from OmenMon
 };
 
 enum hp_thermal_profile_victus {
@@ -299,6 +311,82 @@ static const struct key_entry hp_wmi_keymap[] = {
 	{ KE_END, 0 }
 };
 
+// RGB Color structure for individual zones
+struct hp_omen_rgb_color {
+    u8 red;
+    u8 green;
+    u8 blue;
+} __packed;
+
+#define HP_OMEN_KEYBOARD_ZONES 4
+#define HP_OMEN_COLOR_TABLE_PADDING 24
+
+struct hp_omen_keyboard_colors {
+    u8 zone_count;  // Number of zones (should be 3 for 4 zones, 0-indexed)
+    u8 padding[HP_OMEN_COLOR_TABLE_PADDING - 1];  // BIOS required padding
+    struct hp_omen_rgb_color zones[HP_OMEN_KEYBOARD_ZONES];  // Zone colors
+} __packed;
+
+// Keyboard zones enum (based on OmenMon KbdZone)
+enum hp_omen_keyboard_zone {
+    HP_OMEN_ZONE_RIGHT = 0,   // Right side (arrows, nav keys)
+    HP_OMEN_ZONE_MIDDLE = 1,  // Middle section (F6-F12, right QWERTY)
+    HP_OMEN_ZONE_LEFT = 2,    // Left section (F1-F5, left QWERTY)  
+    HP_OMEN_ZONE_WASD = 3,    // WASD keys
+};
+
+// Global variable to track keyboard RGB support
+static bool hp_omen_keyboard_rgb_support = false;
+
+/* Forward declarations */
+static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
+                                void *buffer, int insize, int outsize);
+static int hp_omen_keyboard_set_colors(struct hp_omen_keyboard_colors *colors);
+
+
+static int hp_omen_keyboard_check_support(void)
+{
+    u8 support_data[4] = {0};
+    int ret;
+
+    ret = hp_wmi_perform_query(HPWMI_KEYBOARD_BACKLIGHT_SUPPORT_QUERY, 
+                              HPWMI_KEYBOARD_CMD,
+                              support_data, sizeof(support_data), sizeof(support_data));
+
+    if (ret != 0) {
+        pr_debug("Keyboard RGB support query failed: %d\n", ret);
+        return 0; // Assume not supported on failure
+    }
+
+    // Check if bit 0 indicates backlight support (from OmenMon analysis)
+    return (support_data[0] & 0x01) ? 1 : 0;
+}
+
+/**
+ * hp_omen_keyboard_get_colors - Get current keyboard RGB colors
+ * @colors: Output buffer for color data
+ * Returns: 0 on success, negative on error
+ */
+static int hp_omen_keyboard_get_colors(struct hp_omen_keyboard_colors *colors)
+{
+    int ret;
+
+    if (!colors)
+        return -EINVAL;
+
+    memset(colors, 0, sizeof(*colors));
+
+    ret = hp_wmi_perform_query(HPWMI_KEYBOARD_COLOR_GET_QUERY,
+                              HPWMI_KEYBOARD_CMD,
+                              colors, sizeof(*colors), sizeof(*colors));
+
+    if (ret != 0) {
+        pr_warn("Failed to get keyboard colors: %d\n", ret);
+        return ret;
+    }
+
+    return 0;
+}
 /*
  * Mutex for the active_platform_profile variable,
  * see omen_powersource_event.
@@ -380,6 +468,8 @@ static inline int encode_outsize_for_pvsz(int outsize)
  *       buffer = kzalloc(128, GFP_KERNEL);
  *       ret = hp_wmi_perform_query(HPWMI_BATTERY_QUERY, HPWMI_READ, buffer, 1, 128)
  */
+
+ /* Forward declarations */
 static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
 				void *buffer, int insize, int outsize)
 {
@@ -914,6 +1004,309 @@ static int camera_shutter_input_setup(void)
 	input_free_device(camera_shutter_input_dev);
 	camera_shutter_input_dev = NULL;
 	return err;
+}
+
+static int hp_omen_keyboard_get_backlight_state(void)
+{
+    u8 state_data[4] = {0};
+    int ret;
+
+    ret = hp_wmi_perform_query(HPWMI_KEYBOARD_BACKLIGHT_GET_QUERY,
+                              HPWMI_KEYBOARD_CMD,
+                              state_data, sizeof(state_data), sizeof(state_data));
+
+    if (ret != 0) {
+        pr_warn("Failed to get backlight state: %d\n", ret);
+        return ret;
+    }
+
+    // Based on OmenMon Backlight enum: 0x64 = off, 0xE4 = on
+    return (state_data[0] == 0xE4) ? 1 : 0;
+}
+
+/**
+ * hp_omen_keyboard_set_backlight_state - Set keyboard backlight on/off state
+ * @state: 1 to turn on, 0 to turn off
+ * Returns: 0 on success, negative on error
+ */
+static int hp_omen_keyboard_set_backlight_state(int state)
+{
+    u8 backlight_data[4];
+    int ret;
+
+    // Based on OmenMon Backlight enum values
+    backlight_data[0] = state ? 0xE4 : 0x64;  // On : Off
+    backlight_data[1] = 0x00;
+    backlight_data[2] = 0x00;
+    backlight_data[3] = 0x00;
+
+    ret = hp_wmi_perform_query(HPWMI_KEYBOARD_BACKLIGHT_SET_QUERY,
+                              HPWMI_KEYBOARD_CMD,
+                              backlight_data, sizeof(backlight_data), 0);
+
+    if (ret != 0) {
+        pr_warn("Failed to set backlight state: %d\n", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+static ssize_t keyboard_rgb_colors_show(struct device *dev,
+                                       struct device_attribute *attr,
+                                       char *buf)
+{
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return -ENODEV;
+
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret)
+        return ret;
+
+    return sprintf(buf, "%02x%02x%02x:%02x%02x%02x:%02x%02x%02x:%02x%02x%02x\n",
+                   colors.zones[HP_OMEN_ZONE_RIGHT].red,
+                   colors.zones[HP_OMEN_ZONE_RIGHT].green,
+                   colors.zones[HP_OMEN_ZONE_RIGHT].blue,
+                   colors.zones[HP_OMEN_ZONE_MIDDLE].red,
+                   colors.zones[HP_OMEN_ZONE_MIDDLE].green,
+                   colors.zones[HP_OMEN_ZONE_MIDDLE].blue,
+                   colors.zones[HP_OMEN_ZONE_LEFT].red,
+                   colors.zones[HP_OMEN_ZONE_LEFT].green,
+                   colors.zones[HP_OMEN_ZONE_LEFT].blue,
+                   colors.zones[HP_OMEN_ZONE_WASD].red,
+                   colors.zones[HP_OMEN_ZONE_WASD].green,
+                   colors.zones[HP_OMEN_ZONE_WASD].blue);
+}
+
+/**
+ * keyboard_rgb_colors_store - Set RGB colors for all zones
+ * Format: "RRGGBB:RRGGBB:RRGGBB:RRGGBB" (Right:Middle:Left:WASD)
+ */
+static ssize_t keyboard_rgb_colors_store(struct device *dev,
+                                        struct device_attribute *attr,
+                                        const char *buf, size_t count)
+{
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+    unsigned int r[4], g[4], b[4];
+
+    if (!hp_omen_keyboard_rgb_support)
+        return -ENODEV;
+
+    // Parse format: "RRGGBB:RRGGBB:RRGGBB:RRGGBB"
+    ret = sscanf(buf, "%02x%02x%02x:%02x%02x%02x:%02x%02x%02x:%02x%02x%02x",
+                 &r[0], &g[0], &b[0],  // Right zone
+                 &r[1], &g[1], &b[1],  // Middle zone
+                 &r[2], &g[2], &b[2],  // Left zone
+                 &r[3], &g[3], &b[3]); // WASD zone
+
+    if (ret != 12) {
+        pr_warn("Invalid RGB format. Use: RRGGBB:RRGGBB:RRGGBB:RRGGBB\n");
+        return -EINVAL;
+    }
+
+    // Validate color values
+    for (int i = 0; i < 4; i++) {
+        if (r[i] > 255 || g[i] > 255 || b[i] > 255) {
+            return -EINVAL;
+        }
+    }
+
+    // Set up color structure
+    memset(&colors, 0, sizeof(colors));
+    colors.zone_count = 3; // 4 zones, 0-indexed (as per OmenMon)
+
+    colors.zones[HP_OMEN_ZONE_RIGHT].red = r[0];
+    colors.zones[HP_OMEN_ZONE_RIGHT].green = g[0];
+    colors.zones[HP_OMEN_ZONE_RIGHT].blue = b[0];
+
+    colors.zones[HP_OMEN_ZONE_MIDDLE].red = r[1];
+    colors.zones[HP_OMEN_ZONE_MIDDLE].green = g[1];
+    colors.zones[HP_OMEN_ZONE_MIDDLE].blue = b[1];
+
+    colors.zones[HP_OMEN_ZONE_LEFT].red = r[2];
+    colors.zones[HP_OMEN_ZONE_LEFT].green = g[2];
+    colors.zones[HP_OMEN_ZONE_LEFT].blue = b[2];
+
+    colors.zones[HP_OMEN_ZONE_WASD].red = r[3];
+    colors.zones[HP_OMEN_ZONE_WASD].green = g[3];
+    colors.zones[HP_OMEN_ZONE_WASD].blue = b[3];
+
+    ret = hp_omen_keyboard_set_colors(&colors);
+    if (ret)
+        return ret;
+
+    return count;
+}
+
+/**
+ * keyboard_backlight_show - Show current backlight state
+ */
+static ssize_t keyboard_backlight_show(struct device *dev,
+                                     struct device_attribute *attr,
+                                     char *buf)
+{
+    int state;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return -ENODEV;
+
+    state = hp_omen_keyboard_get_backlight_state();
+    if (state < 0)
+        return state;
+
+    return sprintf(buf, "%d\n", state);
+}
+
+/**
+ * keyboard_backlight_store - Set backlight state
+ */
+static ssize_t keyboard_backlight_store(struct device *dev,
+                                      struct device_attribute *attr,
+                                      const char *buf, size_t count)
+{
+    int state, ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return -ENODEV;
+
+    ret = kstrtoint(buf, 0, &state);
+    if (ret)
+        return ret;
+
+    if (state < 0 || state > 1)
+        return -EINVAL;
+
+    ret = hp_omen_keyboard_set_backlight_state(state);
+    if (ret)
+        return ret;
+
+    return count;
+}
+
+// Individual zone control attributes
+static ssize_t keyboard_zone_right_show(struct device *dev,
+                                       struct device_attribute *attr,
+                                       char *buf)
+{
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return -ENODEV;
+
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret)
+        return ret;
+
+    return sprintf(buf, "%02x%02x%02x\n",
+                   colors.zones[HP_OMEN_ZONE_RIGHT].red,
+                   colors.zones[HP_OMEN_ZONE_RIGHT].green,
+                   colors.zones[HP_OMEN_ZONE_RIGHT].blue);
+}
+
+static ssize_t keyboard_zone_right_store(struct device *dev,
+                                        struct device_attribute *attr,
+                                        const char *buf, size_t count)
+{
+    struct hp_omen_keyboard_colors colors;
+    unsigned int r, g, b;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return -ENODEV;
+
+    ret = sscanf(buf, "%02x%02x%02x", &r, &g, &b);
+    if (ret != 3 || r > 255 || g > 255 || b > 255)
+        return -EINVAL;
+
+    // Get current colors first to preserve other zones
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret)
+        return ret;
+
+    // Update only the right zone
+    colors.zones[HP_OMEN_ZONE_RIGHT].red = r;
+    colors.zones[HP_OMEN_ZONE_RIGHT].green = g;
+    colors.zones[HP_OMEN_ZONE_RIGHT].blue = b;
+
+    ret = hp_omen_keyboard_set_colors(&colors);
+    if (ret)
+        return ret;
+
+    return count;
+}
+
+// Similar functions for other zones would go here...
+// (keyboard_zone_middle_*, keyboard_zone_left_*, keyboard_zone_wasd_*)
+
+// Device attributes
+static DEVICE_ATTR_RW(keyboard_rgb_colors);
+static DEVICE_ATTR_RW(keyboard_backlight);
+static DEVICE_ATTR_RW(keyboard_zone_right);
+// Add other zone attributes here...
+
+// Add to the existing hp_wmi_attrs array:
+static struct attribute *hp_wmi_keyboard_attrs[] = {
+    &dev_attr_keyboard_rgb_colors.attr,
+    &dev_attr_keyboard_backlight.attr,
+    &dev_attr_keyboard_zone_right.attr,
+    // Add other zone attributes here...
+    NULL,
+};
+
+static const struct attribute_group hp_wmi_keyboard_attr_group = {
+    .name = "keyboard_rgb",
+    .attrs = hp_wmi_keyboard_attrs,
+};
+
+// ============================================================================
+// Integration with existing hp-wmi.c
+// ============================================================================
+
+/**
+ * hp_omen_keyboard_rgb_setup - Initialize keyboard RGB support
+ * Add this function call to hp_wmi_bios_setup()
+ */
+static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
+{
+    int ret;
+
+    // Check if keyboard RGB is supported
+    ret = hp_omen_keyboard_check_support();
+    if (ret <= 0) {
+        pr_info("Keyboard RGB not supported or detection failed\n");
+        hp_omen_keyboard_rgb_support = false;
+        return 0; // Don't fail driver init if RGB not supported
+    }
+
+    hp_omen_keyboard_rgb_support = true;
+    pr_info("Keyboard RGB support detected\n");
+
+    // Create sysfs attribute group
+    ret = sysfs_create_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+    if (ret) {
+        pr_err("Failed to create keyboard RGB sysfs attributes: %d\n", ret);
+        hp_omen_keyboard_rgb_support = false;
+        return ret;
+    }
+
+    pr_info("Keyboard RGB sysfs interface created\n");
+    return 0;
+}
+
+/**
+ * hp_omen_keyboard_rgb_remove - Clean up keyboard RGB support
+ * Add this function call to hp_wmi_bios_remove()
+ */
+static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
+{
+    if (hp_omen_keyboard_rgb_support) {
+        sysfs_remove_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+    }
 }
 
 static DEVICE_ATTR_RO(display);
