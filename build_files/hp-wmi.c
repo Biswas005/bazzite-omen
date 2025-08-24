@@ -341,7 +341,9 @@ static bool hp_omen_keyboard_rgb_support = false;
 /* Forward declarations */
 static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
                                 void *buffer, int insize, int outsize);
-static int hp_omen_keyboard_set_colors(struct hp_omen_keyboard_colors *colors);
+
+static int hp_omen_keyboard_set_colors(const struct hp_omen_keyboard_colors *colors);
+
 
 
 static int hp_omen_keyboard_check_support(void)
@@ -1271,6 +1273,27 @@ static const struct attribute_group hp_wmi_keyboard_attr_group = {
  * hp_omen_keyboard_rgb_setup - Initialize keyboard RGB support
  * Add this function call to hp_wmi_bios_setup()
  */
+
+
+ static int hp_omen_keyboard_set_colors(const struct hp_omen_keyboard_colors *colors)
+{
+    int ret;
+    
+    if (!colors)
+        return -EINVAL;
+    
+    ret = hp_wmi_perform_query(HPWMI_KEYBOARD_COLOR_SET_QUERY,
+                              HPWMI_KEYBOARD_CMD,
+                              (void *)colors, sizeof(*colors), 0);
+    
+    if (ret != 0) {
+        pr_warn("Failed to set keyboard colors: %d\n", ret);
+        return ret;
+    }
+    
+    return 0;
+}
+
 static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
 {
     int ret;
@@ -2436,13 +2459,19 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 
 	thermal_profile_setup(device);
 
+	 err = hp_omen_keyboard_rgb_setup(device);
+    if (err) {
+        pr_warn("Keyboard RGB setup failed: %d\n", err);
+        // Don't fail driver init, just warn
+    }
+
 	return 0;
 }
 
 static void __exit hp_wmi_bios_remove(struct platform_device *device)
 {
 	int i;
-
+	 hp_omen_keyboard_rgb_remove(device);
 	for (i = 0; i < rfkill2_count; i++) {
 		rfkill_unregister(rfkill2[i].rfkill);
 		rfkill_destroy(rfkill2[i].rfkill);
