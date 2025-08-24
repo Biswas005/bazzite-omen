@@ -351,8 +351,47 @@ static bool hp_omen_keyboard_rgb_support = false;
 static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
                                 void *buffer, int insize, int outsize);
 
+/* Forward-declare the existing static fan control functions */
+static int hp_wmi_fan_speed_max_set(int enabled);
+static int hp_wmi_fan_speed_set_unified(int percentage);
+static int hp_wmi_fan_get_average_speed(void);
+
+/* Our new helpers to detect and cache max RPM */
+static int detected_max_rpm = -1;
+static int hp_wmi_detect_max_fan_rpm(void);
+static int hp_wmi_get_max_fan_rpm(void);
+
 static int hp_omen_keyboard_set_colors(const struct hp_omen_keyboard_colors *colors);
 
+/* Probe-time detection, caches max RPM */
+static int hp_wmi_detect_max_fan_rpm(void)
+{
+    int prev_mode = unified_manual_mode;
+    int prev_speed = unified_fan_speed;
+    int max_rpm;
+
+    /* Force max mode, wait, read average, clamp */
+    hp_wmi_fan_speed_max_set(1);
+    msleep(2000);
+    max_rpm = hp_wmi_fan_get_average_speed();
+    if (max_rpm < 0) max_rpm = 5800;
+    if (max_rpm > 5800) max_rpm = 5800;
+
+    /* Restore previous mode */
+    if (prev_mode)
+        hp_wmi_fan_speed_set_unified(prev_speed);
+    else
+        hp_wmi_fan_speed_set_unified(-1);
+
+    return detected_max_rpm = max_rpm;
+}
+
+static int hp_wmi_get_max_fan_rpm(void)
+{
+    if (detected_max_rpm < 0)
+        return hp_wmi_detect_max_fan_rpm();
+    return detected_max_rpm;
+}
 
 
 static int hp_omen_keyboard_check_support(void)
@@ -412,6 +451,7 @@ static struct notifier_block platform_power_source_nb;
 static enum platform_profile_option active_platform_profile;
 static bool platform_profile_support;
 static bool zero_insize_support;
+
 
 static struct rfkill *wifi_rfkill;
 static struct rfkill *bluetooth_rfkill;
@@ -868,32 +908,7 @@ static int hp_wmi_fan_get_average_speed(void)
  */
 static int hp_wmi_fan_get_max_unified(void)
 {
-    int current_mode = unified_manual_mode;
-    int current_speed = unified_fan_speed;
-    int max_rpm, ret;
-
-    ret = hp_wmi_fan_speed_max_set(1);
-    if (ret)
-        return ret;
-
-    msleep(1000); // Let fan speed stabilize
-
-    max_rpm = hp_wmi_fan_get_average_speed();
-    if (max_rpm < 0)
-        return max_rpm;
-
-    // Clamp max RPM to Windows max value
-    const int FAN_RPM_MAX_CLAMP = 5800;
-    if (max_rpm > FAN_RPM_MAX_CLAMP)
-        max_rpm = FAN_RPM_MAX_CLAMP;
-
-    // Restore previous fan speed/mode
-    if (current_mode && current_speed >= 0)
-        hp_wmi_fan_speed_set_unified(current_speed);
-    else
-        hp_wmi_fan_speed_set_unified(-1); // Auto
-
-    return max_rpm;
+    return hp_wmi_get_max_fan_rpm();
 }
 
 
@@ -2862,45 +2877,32 @@ static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
         if (channel > 0) return -EINVAL;  // Only unified control
         
         if (attr == hwmon_pwm_enable) {
-            // Unified fan mode control
-            switch (val) {
-            case 0:
-                // Max speed mode
-                if (is_victus_s_thermal_profile())
-                    hp_wmi_get_fan_count_userdefine_trigger();
-                return hp_wmi_fan_speed_max_set(1);
-                
-            case 1:
-                // Manual mode - use last manual speed or default to 50%
-                return hp_wmi_fan_speed_set_unified(last_manual_speed);
-                
-            case 2:
-                // Automatic mode
-                if (is_victus_s_thermal_profile()) {
-                    hp_wmi_get_fan_count_userdefine_trigger();
-                    return hp_wmi_fan_speed_max_reset();
-                } else {
-                    return hp_wmi_fan_speed_set_unified(-1);  // Auto
-                }
-                
-            default:
-                return -EINVAL;
-            }
-            
-        } else if (attr == hwmon_pwm_input) {
-            // Unified PWM control (0-255)
-            int percentage;
-            
-            if (val < 0 || val > 255)
-                return -EINVAL;
-            
-            // Convert 0-255 to 0-100 percentage
-            percentage = (val * 100) / 255;
-            if (percentage > 100) percentage = 100;
-            
-            // Set unified manual fan speed
-            return hp_wmi_fan_speed_set_unified(percentage);
+        switch (val) {
+        case 0:  /* Max */
+            unified_manual_mode = false;
+            unified_fan_speed = -1;
+            return hp_wmi_fan_speed_max_set(1);
+        case 1:  /* Manual */
+            unified_manual_mode = true;
+            unified_fan_speed = last_manual_speed;
+            hp_wmi_fan_speed_max_set(0);
+            return hp_wmi_fan_speed_set_unified(last_manual_speed);
+        case 2:  /* Auto */
+            unified_manual_mode = false;
+            unified_fan_speed = -1;
+            hp_wmi_fan_speed_max_set(0);
+            return hp_wmi_fan_speed_set_unified(-1);
+        default:
+            return -EINVAL;
         }
+    } else if (attr == hwmon_pwm_input) {
+        /* Always clear max when user sets PWM */
+        hp_wmi_fan_speed_max_set(0);
+        unified_manual_mode = true;
+        unified_fan_speed = (val * 100) / hp_wmi_get_max_fan_rpm();
+        last_manual_speed = unified_fan_speed;
+        return hp_wmi_fan_speed_set_unified(unified_fan_speed);
+    }
         break;
         
     default:
@@ -2956,6 +2958,8 @@ static int __init hp_wmi_init(void)
 	int event_capable = wmi_has_guid(HPWMI_EVENT_GUID);
 	int bios_capable = wmi_has_guid(HPWMI_BIOS_GUID);
 	int err, tmp = 0;
+	detected_max_rpm = -1;
+    hp_wmi_detect_max_fan_rpm();
 
 	if (!bios_capable && !event_capable)
 		return -ENODEV;
