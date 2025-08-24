@@ -781,46 +781,39 @@ static int hp_wmi_fan_speed_set_unified(int percentage)
 {
     u8 fan_data[4];
     int ret;
-    
+
     if (percentage < -1 || percentage > 100)
         return -EINVAL;
-    
+
     if (percentage == -1) {
-        // Set to automatic mode
         fan_data[0] = HP_FAN_SPEED_AUTOMATIC;
         fan_data[1] = HP_FAN_SPEED_AUTOMATIC;
-        fan_data[2] = 0x00;
-        fan_data[3] = 0x00;
-        
         unified_fan_speed = -1;
         unified_manual_mode = false;
-        
         pr_debug("Set both fans to automatic\n");
     } else {
-        // Set to manual percentage (OmenMon style: same speed for both)
         u8 speed_value = (u8)percentage;
-        if (speed_value == 0) speed_value = 1; // Avoid complete stop
-        
-        fan_data[0] = speed_value;  // CPU fan
-        fan_data[1] = speed_value;  // GPU fan  
-        fan_data[2] = 0x00;
-        fan_data[3] = 0x00;
-        
+        if (speed_value == 0)
+            speed_value = 1; // Avoid complete stop
+
+        fan_data[0] = speed_value;
+        fan_data[1] = speed_value;
         unified_fan_speed = percentage;
         unified_manual_mode = true;
         last_manual_speed = percentage;
-        
         pr_debug("Set both fans to manual %d%%\n", percentage);
     }
-    
+
+    fan_data[2] = 0x00;
+    fan_data[3] = 0x00;
+
     ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
-                              fan_data, sizeof(fan_data), 0);
-    
+            fan_data, sizeof(fan_data), 0);
     if (ret != 0) {
         pr_warn("Failed to set unified fan speed: %d\n", ret);
         return ret;
     }
-    
+
     return 0;
 }
 
@@ -878,23 +871,28 @@ static int hp_wmi_fan_get_max_unified(void)
     int current_mode = unified_manual_mode;
     int current_speed = unified_fan_speed;
     int max_rpm, ret;
-    
-    // Temporarily set to maximum to measure
+
     ret = hp_wmi_fan_speed_max_set(1);
     if (ret)
         return ret;
-    
-    msleep(1000);  // Give fans time to ramp up
-    
+
+    msleep(1000); // Let fan speed stabilize
+
     max_rpm = hp_wmi_fan_get_average_speed();
-    
-    // Restore previous state
-    if (current_mode && current_speed >= 0) {
+    if (max_rpm < 0)
+        return max_rpm;
+
+    // Clamp max RPM to Windows max value
+    const int FAN_RPM_MAX_CLAMP = 5800;
+    if (max_rpm > FAN_RPM_MAX_CLAMP)
+        max_rpm = FAN_RPM_MAX_CLAMP;
+
+    // Restore previous fan speed/mode
+    if (current_mode && current_speed >= 0)
         hp_wmi_fan_speed_set_unified(current_speed);
-    } else {
-        hp_wmi_fan_speed_set_unified(-1);  // Auto
-    }
-    
+    else
+        hp_wmi_fan_speed_set_unified(-1); // Auto
+
     return max_rpm;
 }
 
