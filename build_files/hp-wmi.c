@@ -2869,47 +2869,46 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
     return -EINVAL;
 }
 
-static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
-                             u32 attr, int channel, long val)
+static int hp_wmi_hwmon_write(struct device *dev,
+                              enum hwmon_sensor_types type,
+                              u32 attr, int channel, long val)
 {
-    switch (type) {
-    case hwmon_pwm:
-        if (channel > 0) return -EINVAL;  // Only unified control
-        
-        if (attr == hwmon_pwm_enable) {
-        switch (val) {
-        case 0:  /* Max */
-            unified_manual_mode = false;
-            unified_fan_speed = -1;
-            return hp_wmi_fan_speed_max_set(1);
-        case 1:  /* Manual */
+    if (type == hwmon_pwm && channel == 0) {
+        if (attr == hwmon_pwm_input) {
+            /* Raw PWM duty: 0–255 */
+            if (val < 0 || val > 255)
+                return -EINVAL;
+
+            /* 1) Fan off when pwm1 = 0 */
+            if (val == 0) {
+                unified_manual_mode = false;
+                unified_fan_speed = -1;
+                return hp_wmi_fan_speed_set_unified(-1);
+            }
+
+            /*
+             * 2) Enforce minimum idle PWM at ~36%
+             *    36% of 255 ≈ 92
+             */
+            const int min_pwm = (36 * 255) / 100;
+            if (val < min_pwm)
+                val = min_pwm;
+
+            /* Clear any max-mode */
+            hp_wmi_fan_speed_max_set(0);
+
+            /*
+             * 3) Scale [min_pwm..255] → [0..100]% manual speed
+             */
             unified_manual_mode = true;
-            unified_fan_speed = last_manual_speed;
-            hp_wmi_fan_speed_max_set(0);
-            return hp_wmi_fan_speed_set_unified(last_manual_speed);
-        case 2:  /* Auto */
-            unified_manual_mode = false;
-            unified_fan_speed = -1;
-            hp_wmi_fan_speed_max_set(0);
-            return hp_wmi_fan_speed_set_unified(-1);
-        default:
-            return -EINVAL;
+            unified_fan_speed = ((val - min_pwm) * 100) / (255 - min_pwm);
+            last_manual_speed   = unified_fan_speed;
+
+            return hp_wmi_fan_speed_set_unified(unified_fan_speed);
         }
-    } else if (attr == hwmon_pwm_input) {
-        /* Always clear max when user sets PWM */
-        hp_wmi_fan_speed_max_set(0);
-        unified_manual_mode = true;
-        unified_fan_speed = (val * 100) / hp_wmi_get_max_fan_rpm();
-        last_manual_speed = unified_fan_speed;
-        return hp_wmi_fan_speed_set_unified(unified_fan_speed);
     }
-        break;
-        
-    default:
-        return -EOPNOTSUPP;
-    }
-    
-    return -EINVAL;
+
+    return -EOPNOTSUPP;
 }
 
 
