@@ -33,6 +33,8 @@
 #include <linux/workqueue.h>
 #include <linux/delay.h>        // for msleep()
 #include <linux/workqueue.h>
+#include <linux/leds.h>
+#include <linux/mux/consumer.h>
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
 MODULE_DESCRIPTION("HP laptop WMI driver");
@@ -275,6 +277,8 @@ enum hp_thermal_profile {
 #define IS_HWBLOCKED(x) ((x & HPWMI_POWER_FW_OR_HW) != HPWMI_POWER_FW_OR_HW)
 #define IS_SWBLOCKED(x) !(x & HPWMI_POWER_SOFT)
 
+#define HPWMI_GPU_MUX_GET_QUERY        0x30
+#define HPWMI_GPU_MUX_SET_QUERY        0x31
 
 
 struct bios_rfkill2_device_state {
@@ -347,12 +351,31 @@ enum hp_omen_keyboard_zone {
 // Global variable to track keyboard RGB support
 static bool hp_omen_keyboard_rgb_support = false;
 
+struct hp_kbd_led {
+    struct led_classdev cdev;
+    enum hp_omen_keyboard_zone zone;
+    struct hp_omen_keyboard_colors current_color;
+};
+
+static struct hp_kbd_led *hp_kbd_leds[HP_OMEN_KEYBOARD_ZONES];
+
+/*
+ * GPU MUX switch support
+ */
+struct hp_mux_switch {
+    struct mux_control *mux;
+    bool available;
+    int current_state; // 0 = iGPU, 1 = dGPU
+};
+
+static struct hp_mux_switch hp_gpu_mux;
+
 /* Forward declarations */
 static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
                                 void *buffer, int insize, int outsize);
 
 /* Forward-declare the existing static fan control functions */
-static int hp_wmi_fan_speed_reset(void);v
+static int hp_wmi_fan_speed_reset(void);
 static int hp_wmi_fan_speed_max_set(int enabled);
 static int hp_wmi_fan_speed_set_unified(int percentage);
 static int hp_wmi_fan_get_average_speed(void);
@@ -1214,19 +1237,26 @@ static ssize_t keyboard_rgb_colors_show(struct device *dev,
     if (ret)
         return ret;
 
-    return sprintf(buf, "%02x%02x%02x:%02x%02x%02x:%02x%02x%02x:%02x%02x%02x\n",
-                   colors.zones[HP_OMEN_ZONE_RIGHT].red,
-                   colors.zones[HP_OMEN_ZONE_RIGHT].green,
-                   colors.zones[HP_OMEN_ZONE_RIGHT].blue,
-                   colors.zones[HP_OMEN_ZONE_MIDDLE].red,
-                   colors.zones[HP_OMEN_ZONE_MIDDLE].green,
-                   colors.zones[HP_OMEN_ZONE_MIDDLE].blue,
-                   colors.zones[HP_OMEN_ZONE_LEFT].red,
-                   colors.zones[HP_OMEN_ZONE_LEFT].green,
-                   colors.zones[HP_OMEN_ZONE_LEFT].blue,
-                   colors.zones[HP_OMEN_ZONE_WASD].red,
-                   colors.zones[HP_OMEN_ZONE_WASD].green,
-                   colors.zones[HP_OMEN_ZONE_WASD].blue);
+    // New (correct) ordering
+return sprintf(buf,
+    "%02x%02x%02x:"  // RIGHT (zones[0])
+    "%02x%02x%02x:"  // MIDDLE (zones[1])
+    "%02x%02x%02x:"  // LEFT (zones[2])
+    "%02x%02x%02x\n",// WASD (zones[3])
+    colors.zones[HP_OMEN_ZONE_WASD].red,    // Move WASD to last
+    colors.zones[HP_OMEN_ZONE_WASD].green,
+    colors.zones[HP_OMEN_ZONE_WASD].blue,
+    colors.zones[HP_OMEN_ZONE_RIGHT].red,   // Shift RIGHT to second
+    colors.zones[HP_OMEN_ZONE_RIGHT].green,
+    colors.zones[HP_OMEN_ZONE_RIGHT].blue,
+    colors.zones[HP_OMEN_ZONE_MIDDLE].red,  // SHIFT MIDDLE to third
+    colors.zones[HP_OMEN_ZONE_MIDDLE].green,
+    colors.zones[HP_OMEN_ZONE_MIDDLE].blue,
+    colors.zones[HP_OMEN_ZONE_LEFT].red,    // SHIFT LEFT to first
+    colors.zones[HP_OMEN_ZONE_LEFT].green,
+    colors.zones[HP_OMEN_ZONE_LEFT].blue
+);
+
 }
 
 /**
@@ -1388,6 +1418,100 @@ static ssize_t keyboard_zone_right_store(struct device *dev,
     return count;
 }
 
+
+static void hp_kbd_led_set(struct led_classdev *led_cdev, enum led_brightness brightness)
+{
+    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return;
+
+    // Get current colors for all zones
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret) {
+        pr_warn("Failed to get current keyboard colors for LED update: %d\n", ret);
+        return;
+    }
+
+    // Update only the specific zone with brightness as white level
+    colors.zones[led->zone].red = brightness;
+    colors.zones[led->zone].green = brightness;
+    colors.zones[led->zone].blue = brightness;
+
+    // Store current color for this LED
+    led->current_color.zones[led->zone] = colors.zones[led->zone];
+	 // Apply the change
+    ret = hp_omen_keyboard_set_colors(&colors);
+    if (ret)
+        pr_warn("Failed to set LED brightness for zone %d: %d\n", led->zone, ret);
+}
+
+static enum led_brightness hp_kbd_led_get(struct led_classdev *led_cdev)
+{
+    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return LED_OFF;
+
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret)
+        return LED_OFF;
+
+    // Return the red channel as brightness (assuming RGB are equal for white)
+    return colors.zones[led->zone].red;
+}
+
+static int hp_kbd_led_set_color(struct led_classdev *led_cdev, u32 color)
+{
+    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return -ENODEV;
+
+    // Get current colors
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret)
+        return ret;
+
+    // Extract RGB from 24-bit color value
+    colors.zones[led->zone].red = (color >> 16) & 0xFF;
+    colors.zones[led->zone].green = (color >> 8) & 0xFF;
+    colors.zones[led->zone].blue = color & 0xFF;
+
+    // Store current color
+    led->current_color.zones[led->zone] = colors.zones[led->zone];
+	ret = hp_omen_keyboard_set_colors(&colors);
+    if (ret)
+        pr_warn("Failed to set LED color for zone %d: %d\n", led->zone, ret);
+
+    return ret;
+}
+
+static u32 hp_kbd_led_get_color(struct led_classdev *led_cdev)
+{
+    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return 0;
+
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret)
+        return 0;
+
+    // Combine RGB into 24-bit color value
+    return (colors.zones[led->zone].red << 16) |
+           (colors.zones[led->zone].green << 8) |
+           colors.zones[led->zone].blue;
+}
+
 // Similar functions for other zones would go here...
 // (keyboard_zone_middle_*, keyboard_zone_left_*, keyboard_zone_wasd_*)
 
@@ -1546,6 +1670,16 @@ static struct attribute *hp_wmi_attrs[] = {
 	NULL,
 };
 ATTRIBUTE_GROUPS(hp_wmi);
+
+static struct attribute *hp_wmi_mux_attrs[] = {
+    &dev_attr_gpu_mux_state.attr,
+    NULL,
+};
+
+static const struct attribute_group hp_wmi_mux_attr_group = {
+    .name = "mux_switch",
+    .attrs = hp_wmi_mux_attrs,
+};
 
 static void hp_wmi_notify(union acpi_object *obj, void *context)
 {
@@ -1911,6 +2045,258 @@ struct omen_power_profile {
     u8 cpu_pl1, cpu_pl2, cpu_pl4, cpu_combined;
     u8 gpu_ctgp, gpu_ppab, gpu_dstate, gpu_peak_temp;
 };
+
+static int hp_gpu_mux_get_state(void)
+{
+    int state = 0;
+    int ret;
+
+    ret = hp_wmi_perform_query(HPWMI_GPU_MUX_GET_QUERY, HPWMI_GM,
+                              &state, zero_if_sup(state), sizeof(state));
+    if (ret) {
+        pr_debug("GPU MUX query failed: %d\n", ret);
+        return ret;
+    }
+
+    return state; // 0 = iGPU, 1 = dGPU
+}
+
+static int hp_gpu_mux_set_state(int state)
+{
+    int ret;
+
+    if (state < 0 || state > 1)
+        return -EINVAL;
+
+    ret = hp_wmi_perform_query(HPWMI_GPU_MUX_SET_QUERY, HPWMI_GM,
+                              &state, sizeof(state), 0);
+    if (ret) {
+        pr_warn("Failed to set GPU MUX state to %d: %d\n", state, ret);
+        return ret;
+    }
+
+    hp_gpu_mux.current_state = state;
+    pr_info("GPU MUX switched to %s\n", state ? "dGPU" : "iGPU");
+    return 0;
+}
+
+static int hp_mux_switch_init(struct platform_device *pdev)
+{
+    int ret;
+
+    // Check if GPU MUX is available
+    ret = hp_gpu_mux_get_state();
+    if (ret < 0) {
+        pr_debug("GPU MUX not available: %d\n", ret);
+        hp_gpu_mux.available = false;
+        return 0;
+    }
+
+    hp_gpu_mux.current_state = ret;
+    hp_gpu_mux.available = true;
+
+    // Register MUX control (optional, requires MUX subsystem)
+    hp_gpu_mux.mux = devm_mux_control_get(&pdev->dev, "gpu-mux");
+    if (IS_ERR(hp_gpu_mux.mux)) {
+        pr_debug("MUX control registration failed, continuing without it\n");
+        hp_gpu_mux.mux = NULL;
+    }
+
+    pr_info("GPU MUX switch available, current state: %s\n",
+            hp_gpu_mux.current_state ? "dGPU" : "iGPU");
+
+    return 0;
+}
+
+static ssize_t gpu_mux_state_show(struct device *dev,
+                                  struct device_attribute *attr,
+                                  char *buf)
+{
+    int state;
+
+    if (!hp_gpu_mux.available)
+        return -ENODEV;
+
+    state = hp_gpu_mux_get_state();
+    if (state < 0)
+        return state;
+
+    return sprintf(buf, "%s\n", state ? "dgpu" : "igpu");
+}
+
+static ssize_t gpu_mux_state_store(struct device *dev,
+                                   struct device_attribute *attr,
+                                   const char *buf, size_t count)
+{
+    int state, ret;
+
+    if (!hp_gpu_mux.available)
+        return -ENODEV;
+
+    if (strncmp(buf, "igpu", 4) == 0) {
+        state = 0;
+    } else if (strncmp(buf, "dgpu", 4) == 0) {
+        state = 1;
+    } else {
+        return -EINVAL;
+    }
+
+    ret = hp_gpu_mux_set_state(state);
+    if (ret)
+        return ret;
+
+    return count;
+}
+
+static DEVICE_ATTR_RW(gpu_mux_state);
+
+static int hp_kbd_leds_init(struct platform_device *pdev)
+{
+    static const char *zone_names[HP_OMEN_KEYBOARD_ZONES] = {
+        "keyboard_right", "keyboard_middle", "keyboard_left", "keyboard_wasd"
+    };
+    int i, err = 0;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return 0;
+
+    for (i = 0; i < HP_OMEN_KEYBOARD_ZONES; i++) {
+        struct hp_kbd_led *led;
+        char *name;
+
+        led = kzalloc(sizeof(*led), GFP_KERNEL);
+        if (!led) {
+            err = -ENOMEM;
+            goto cleanup;
+        }
+
+        led->zone = i;
+        
+        // Create LED name in format "hp::keyboard_zone"
+        name = kasprintf(GFP_KERNEL, "hp::%s", zone_names[i]);
+        if (!name) {
+            kfree(led);
+            err = -ENOMEM;
+            goto cleanup;
+        }
+
+        led->cdev.name = name;
+        led->cdev.max_brightness = LED_FULL;
+        led->cdev.brightness_set = hp_kbd_led_set;
+        led->cdev.brightness_get = hp_kbd_led_get;
+        
+        // Add RGB color support for advanced LED controllers
+        led->cdev.flags = LED_BRIGHT_HW_CHANGED | LED_RETAIN_AT_SHUTDOWN;
+        
+        // Register the LED class device
+        err = led_classdev_register(&pdev->dev, &led->cdev);
+        if (err) {
+            kfree((char*)led->cdev.name);
+            kfree(led);
+            pr_warn("Failed to register LED for zone %d: %d\n", i, err);
+            goto cleanup;
+        }
+
+        hp_kbd_leds[i] = led;
+        pr_debug("Registered LED device: %s\n", led->cdev.name);
+    }
+
+    pr_info("HP Omen keyboard LED devices registered for OpenRGB compatibility\n");
+    return 0;
+
+cleanup:
+    // Clean up any LEDs that were successfully registered
+    while (i-- > 0) {
+        if (hp_kbd_leds[i]) {
+            led_classdev_unregister(&hp_kbd_leds[i]->cdev);
+            kfree((char*)hp_kbd_leds[i]->cdev.name);
+            kfree(hp_kbd_leds[i]);
+            hp_kbd_leds[i] = NULL;
+        }
+    }
+    return err;
+}
+
+static void hp_kbd_leds_remove(void)
+{
+    int i;
+
+    for (i = 0; i < HP_OMEN_KEYBOARD_ZONES; i++) {
+        if (hp_kbd_leds[i]) {
+            led_classdev_unregister(&hp_kbd_leds[i]->cdev);
+            kfree((char*)hp_kbd_leds[i]->cdev.name);
+            kfree(hp_kbd_leds[i]);
+            hp_kbd_leds[i] = NULL;
+        }
+    }
+}
+
+// Update the existing hp_omen_keyboard_rgb_setup function
+static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
+{
+    int ret;
+
+    // Check if keyboard RGB is supported
+    ret = hp_omen_keyboard_check_support();
+    if (ret <= 0) {
+        pr_info("Keyboard RGB not supported or detection failed\n");
+        hp_omen_keyboard_rgb_support = false;
+        return 0; // Don't fail driver init if RGB not supported
+    }
+
+    hp_omen_keyboard_rgb_support = true;
+    pr_info("Keyboard RGB support detected\n");
+
+    // Create sysfs attribute group
+    ret = sysfs_create_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+    if (ret) {
+        pr_err("Failed to create keyboard RGB sysfs attributes: %d\n", ret);
+        hp_omen_keyboard_rgb_support = false;
+        return ret;
+    }
+
+    // Initialize LED class devices for OpenRGB compatibility
+    ret = hp_kbd_leds_init(device);
+    if (ret) {
+        pr_warn("Failed to initialize keyboard LED devices: %d\n", ret);
+        // Don't fail here, sysfs interface still works
+    }
+
+    // Initialize GPU MUX switch
+    ret = hp_mux_switch_init(device);
+    if (ret) {
+        pr_warn("Failed to initialize GPU MUX switch: %d\n", ret);
+        // Don't fail here, it's optional
+    }
+
+    // Add GPU MUX sysfs attribute if available
+    if (hp_gpu_mux.available) {
+        ret = device_create_file(&device->dev, &dev_attr_gpu_mux_state);
+        if (ret) {
+            pr_warn("Failed to create GPU MUX sysfs attribute: %d\n", ret);
+        }
+    }
+
+    pr_info("Keyboard RGB and LED interfaces created\n");
+    return 0;
+}
+
+// Update the existing hp_omen_keyboard_rgb_remove function
+static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
+{
+    // Remove GPU MUX sysfs attribute
+    if (hp_gpu_mux.available) {
+        device_remove_file(&device->dev, &dev_attr_gpu_mux_state);
+    }
+
+    // Remove LED class devices
+    hp_kbd_leds_remove();
+
+    // Remove sysfs attribute group
+    if (hp_omen_keyboard_rgb_support) {
+        sysfs_remove_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+    }
+}
 
 static const struct omen_power_profile omen_profiles[] = {
     // Cool
@@ -2656,23 +3042,37 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 
 	thermal_profile_setup(device);
 
-	 err = hp_omen_keyboard_rgb_setup(device);
+	  err = hp_omen_keyboard_rgb_setup(device);
     if (err) {
         pr_warn("Keyboard RGB setup failed: %d\n", err);
         // Don't fail driver init, just warn
     }
 
+    // Add MUX switch attribute group to main sysfs interface
+    if (hp_gpu_mux.available) {
+        err = sysfs_create_group(&device->dev.kobj, &hp_wmi_mux_attr_group);
+        if (err) {
+            pr_warn("Failed to create MUX switch sysfs group: %d\n", err);
+        }
+    }
 	return 0;
 }
 
 static void __exit hp_wmi_bios_remove(struct platform_device *device)
 {
 	int i;
-	 hp_omen_keyboard_rgb_remove(device);
-	for (i = 0; i < rfkill2_count; i++) {
-		rfkill_unregister(rfkill2[i].rfkill);
-		rfkill_destroy(rfkill2[i].rfkill);
-	}
+	
+	 // Remove MUX switch sysfs group
+    if (hp_gpu_mux.available) {
+        sysfs_remove_group(&device->dev.kobj, &hp_wmi_mux_attr_group);
+    }
+
+    hp_omen_keyboard_rgb_remove(device);
+
+    for (i = 0; i < rfkill2_count; i++) {
+        rfkill_unregister(rfkill2[i].rfkill);
+        rfkill_destroy(rfkill2[i].rfkill);
+    }
 
 	if (wifi_rfkill) {
 		rfkill_unregister(wifi_rfkill);
