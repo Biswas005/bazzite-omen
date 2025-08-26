@@ -34,7 +34,6 @@
 #include <linux/delay.h>        // for msleep()
 #include <linux/workqueue.h>
 #include <linux/leds.h>
-#include <linux/mux/consumer.h>
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
 MODULE_DESCRIPTION("HP laptop WMI driver");
@@ -359,16 +358,7 @@ struct hp_kbd_led {
 
 static struct hp_kbd_led *hp_kbd_leds[HP_OMEN_KEYBOARD_ZONES];
 
-/*
- * GPU MUX switch support
- */
-struct hp_mux_switch {
-    struct mux_control *mux;
-    bool available;
-    int current_state; // 0 = iGPU, 1 = dGPU
-};
 
-static struct hp_mux_switch hp_gpu_mux;
 
 /* Forward declarations */
 static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
@@ -1650,15 +1640,6 @@ static ssize_t fan_unified_store(struct device *dev,
     return ret ? ret : count;
 }
 
-
-static ssize_t gpu_mux_state_show(struct device *dev,
-                                 struct device_attribute *attr,
-                                 char *buf);
-
-static ssize_t gpu_mux_state_store(struct device *dev,
-                                   struct device_attribute *attr,
-                                   const char *buf, size_t count);
-
 static DEVICE_ATTR_RW(fan_unified);
 
 static DEVICE_ATTR_RO(display);
@@ -1667,7 +1648,6 @@ static DEVICE_ATTR_RW(als);
 static DEVICE_ATTR_RO(dock);
 static DEVICE_ATTR_RO(tablet);
 static DEVICE_ATTR_RW(postcode);
-static DEVICE_ATTR_RW(gpu_mux_state);
 
 static struct attribute *hp_wmi_attrs[] = {
 	&dev_attr_display.attr,
@@ -1680,15 +1660,6 @@ static struct attribute *hp_wmi_attrs[] = {
 	NULL,
 };
 ATTRIBUTE_GROUPS(hp_wmi);
-
-static struct attribute *hp_wmi_mux_attrs[] = {
-	&dev_attr_gpu_mux_state.attr,
-	NULL,
-};
-static const struct attribute_group hp_wmi_mux_attr_group = {
-	.name = "mux_switch",
-	.attrs = hp_wmi_mux_attrs,
-};
 
 static void hp_wmi_notify(union acpi_object *obj, void *context)
 {
@@ -2055,107 +2026,9 @@ struct omen_power_profile {
     u8 gpu_ctgp, gpu_ppab, gpu_dstate, gpu_peak_temp;
 };
 
-static int hp_gpu_mux_get_state(void)
-{
-    int state = 0;
-    int ret;
-
-    ret = hp_wmi_perform_query(HPWMI_GPU_MUX_GET_QUERY, HPWMI_GM,
-                              &state, zero_if_sup(state), sizeof(state));
-    if (ret) {
-        pr_debug("GPU MUX query failed: %d\n", ret);
-        return ret;
-    }
-
-    return state; // 0 = iGPU, 1 = dGPU
-}
-
-static int hp_gpu_mux_set_state(int state)
-{
-    int ret;
-
-    if (state < 0 || state > 1)
-        return -EINVAL;
-
-    ret = hp_wmi_perform_query(HPWMI_GPU_MUX_SET_QUERY, HPWMI_GM,
-                              &state, sizeof(state), 0);
-    if (ret) {
-        pr_warn("Failed to set GPU MUX state to %d: %d\n", state, ret);
-        return ret;
-    }
-
-    hp_gpu_mux.current_state = state;
-    pr_info("GPU MUX switched to %s\n", state ? "dGPU" : "iGPU");
-    return 0;
-}
-
-static int hp_mux_switch_init(struct platform_device *pdev)
-{
-    int ret;
-
-    // Check if GPU MUX is available
-    ret = hp_gpu_mux_get_state();
-    if (ret < 0) {
-        pr_debug("GPU MUX not available: %d\n", ret);
-        hp_gpu_mux.available = false;
-        return 0;
-    }
-
-    hp_gpu_mux.current_state = ret;
-    hp_gpu_mux.available = true;
-
-    // Register MUX control (optional, requires MUX subsystem)
-    hp_gpu_mux.mux = devm_mux_control_get(&pdev->dev, "gpu-mux");
-    if (IS_ERR(hp_gpu_mux.mux)) {
-        pr_debug("MUX control registration failed, continuing without it\n");
-        hp_gpu_mux.mux = NULL;
-    }
-
-    pr_info("GPU MUX switch available, current state: %s\n",
-            hp_gpu_mux.current_state ? "dGPU" : "iGPU");
-
-    return 0;
-}
-
-static ssize_t gpu_mux_state_show(struct device *dev,
-                                  struct device_attribute *attr,
-                                  char *buf)
-{
-    int state;
-
-    if (!hp_gpu_mux.available)
-        return -ENODEV;
-
-    state = hp_gpu_mux_get_state();
-    if (state < 0)
-        return state;
-
-    return sprintf(buf, "%s\n", state ? "dgpu" : "igpu");
-}
-
-static ssize_t gpu_mux_state_store(struct device *dev,
-                                   struct device_attribute *attr,
-                                   const char *buf, size_t count)
-{
-    int state, ret;
-
-    if (!hp_gpu_mux.available)
-        return -ENODEV;
-
-    if (strncmp(buf, "igpu", 4) == 0) {
-        state = 0;
-    } else if (strncmp(buf, "dgpu", 4) == 0) {
-        state = 1;
-    } else {
-        return -EINVAL;
-    }
-
-    ret = hp_gpu_mux_set_state(state);
-    if (ret)
-        return ret;
-
-    return count;
-}
+static ssize_t color_show(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t color_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static DEVICE_ATTR_RW(color);
 
 static int hp_kbd_leds_init(struct platform_device *pdev)
 {
@@ -2191,8 +2064,8 @@ static int hp_kbd_leds_init(struct platform_device *pdev)
         led->cdev.max_brightness = LED_FULL;
         led->cdev.brightness_set = hp_kbd_led_set;
         led->cdev.brightness_get = hp_kbd_led_get;
-        
-        // Add RGB color support for advanced LED controllers
+        //open-rgb identification
+		        // Add RGB color support for advanced LED controllers
         led->cdev.flags = LED_BRIGHT_HW_CHANGED | LED_RETAIN_AT_SHUTDOWN;
         
         // Register the LED class device
@@ -2206,6 +2079,7 @@ static int hp_kbd_leds_init(struct platform_device *pdev)
 
         hp_kbd_leds[i] = led;
         pr_debug("Registered LED device: %s\n", led->cdev.name);
+		sysfs_create_file(&led->cdev.dev->kobj, &dev_attr_color.attr);
     }
 
     pr_info("HP Omen keyboard LED devices registered for OpenRGB compatibility\n");
@@ -2222,6 +2096,39 @@ cleanup:
         }
     }
     return err;
+}
+
+// Add near other device attributes
+
+static ssize_t color_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct led_classdev *cdev = dev_get_drvdata(dev);
+    struct hp_kbd_led *led = container_of(cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret) return ret;
+    return sprintf(buf, "%02x%02x%02x\n",
+        colors.zones[led->zone].red,
+        colors.zones[led->zone].green,
+        colors.zones[led->zone].blue);
+}
+
+static ssize_t color_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct led_classdev *cdev = dev_get_drvdata(dev);
+    struct hp_kbd_led *led = container_of(cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    unsigned int r, g, b;
+    int ret = sscanf(buf, "%02x%02x%02x", &r, &g, &b);
+    if (ret != 3) return -EINVAL;
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret) return ret;
+    colors.zones[led->zone].red = r;
+    colors.zones[led->zone].green = g;
+    colors.zones[led->zone].blue = b;
+    ret = hp_omen_keyboard_set_colors(&colors);
+    if (ret) return ret;
+    return count;
 }
 
 static void hp_kbd_leds_remove(void)
@@ -2269,21 +2176,6 @@ static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
         // Don't fail here, sysfs interface still works
     }
 
-    // Initialize GPU MUX switch
-    ret = hp_mux_switch_init(device);
-    if (ret) {
-        pr_warn("Failed to initialize GPU MUX switch: %d\n", ret);
-        // Don't fail here, it's optional
-    }
-
-    // Add GPU MUX sysfs attribute if available
-    if (hp_gpu_mux.available) {
-        ret = device_create_file(&device->dev, &dev_attr_gpu_mux_state);
-        if (ret) {
-            pr_warn("Failed to create GPU MUX sysfs attribute: %d\n", ret);
-        }
-    }
-
     pr_info("Keyboard RGB and LED interfaces created\n");
     return 0;
 }
@@ -2291,10 +2183,6 @@ static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
 // Update the existing hp_omen_keyboard_rgb_remove function
 static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
 {
-    // Remove GPU MUX sysfs attribute
-    if (hp_gpu_mux.available) {
-        device_remove_file(&device->dev, &dev_attr_gpu_mux_state);
-    }
 
     // Remove LED class devices
     hp_kbd_leds_remove();
@@ -3054,25 +2942,12 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
         pr_warn("Keyboard RGB setup failed: %d\n", err);
         // Don't fail driver init, just warn
     }
-
-    // Add MUX switch attribute group to main sysfs interface
-    if (hp_gpu_mux.available) {
-        err = sysfs_create_group(&device->dev.kobj, &hp_wmi_mux_attr_group);
-        if (err) {
-            pr_warn("Failed to create MUX switch sysfs group: %d\n", err);
-        }
-    }
 	return 0;
 }
 
 static void __exit hp_wmi_bios_remove(struct platform_device *device)
 {
 	int i;
-	
-	 // Remove MUX switch sysfs group
-    if (hp_gpu_mux.available) {
-        sysfs_remove_group(&device->dev.kobj, &hp_wmi_mux_attr_group);
-    }
 
     hp_omen_keyboard_rgb_remove(device);
 
@@ -3146,11 +3021,16 @@ static const struct dev_pm_ops hp_wmi_pm_ops = {
 // Use official 2-step reset sequence on enabling auto mode
 static int hp_wmi_enable_auto_fan_mode(void)
 {
-	int ret;
+    int ret;
 
-	// Disable max mode first
-	ret = hp_wmi_fan_speed_max_reset();
-	return ret;
+    // Disable max mode first
+    ret = hp_wmi_fan_speed_max_set(0);
+    if (ret)
+        return ret;
+
+    // Reset to automatic speed
+    ret = hp_wmi_fan_speed_reset();
+    return ret;
 }
 
 
@@ -3347,7 +3227,7 @@ static int hp_wmi_hwmon_write(struct device *dev,
         if (val == 0) {
             unified_manual_mode = false;
             unified_fan_speed = -1;
-            hp_wmi_fan_speed_reset();
+            hp_wmi_enable_auto_fan_mode();
             return 0;
         }
 
@@ -3361,7 +3241,6 @@ static int hp_wmi_hwmon_write(struct device *dev,
     }
     return -EOPNOTSUPP;
 }
-
 
 // Update hwmon channel info for unified control
 static const struct hwmon_channel_info * const info[] = {
@@ -3408,8 +3287,8 @@ static int __init hp_wmi_init(void)
 	int event_capable = wmi_has_guid(HPWMI_EVENT_GUID);
 	int bios_capable = wmi_has_guid(HPWMI_BIOS_GUID);
 	int err, tmp = 0;
-	// detected_max_rpm = -1;
-   // hp_wmi_detect_max_fan_rpm();
+	detected_max_rpm = -1;
+    hp_wmi_detect_max_fan_rpm();
 
 	if (!bios_capable && !event_capable)
 		return -ENODEV;
