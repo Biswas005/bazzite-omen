@@ -372,16 +372,11 @@ static int hp_wmi_detect_max_fan_rpm(void)
 
     /* Force max mode, wait, read average, clamp */
     hp_wmi_fan_speed_max_set(1);
-    msleep(2000);
+    msleep(200);
     max_rpm = hp_wmi_fan_get_average_speed();
-    if (max_rpm < 0) max_rpm = 5800;
-    if (max_rpm > 5800) max_rpm = 5800;
 
     /* Restore previous mode */
-    if (prev_mode)
-        hp_wmi_fan_speed_set_unified(prev_speed);
-    else
-        hp_wmi_fan_speed_set_unified(-1);
+    hp_wmi_fan_speed_reset()
 
     return detected_max_rpm = max_rpm;
 }
@@ -2746,13 +2741,9 @@ static int hp_wmi_enable_auto_fan_mode(void)
     int ret;
 
     // Disable max mode first
-    ret = hp_wmi_fan_speed_max_set(0);
+    ret = hp_wmi_fan_speed_max_reset(); 
     if (ret)
         return ret;
-
-    // Reset to automatic speed
-    ret = hp_wmi_fan_speed_reset();
-    return ret;
 }
 
 
@@ -2949,7 +2940,7 @@ static int hp_wmi_hwmon_write(struct device *dev,
         if (val == 0) {
             unified_manual_mode = false;
             unified_fan_speed = -1;
-            hp_wmi_enable_auto_fan_mode();
+            hp_wmi_fan_speed_reset();
             return 0;
         }
 
