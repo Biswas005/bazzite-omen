@@ -3146,10 +3146,11 @@ static const struct dev_pm_ops hp_wmi_pm_ops = {
 // Use official 2-step reset sequence on enabling auto mode
 static int hp_wmi_enable_auto_fan_mode(void)
 {
-    int ret;
+	int ret;
 
-    // Disable max mode first
-    ret = hp_wmi_fan_speed_max_reset();
+	// Disable max mode first
+	ret = hp_wmi_fan_speed_max_reset();
+	return ret;
 }
 
 
