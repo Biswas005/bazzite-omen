@@ -1564,43 +1564,43 @@ static const struct attribute_group hp_wmi_keyboard_attr_group = {
     return 0;
 }
 
-static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
-{
-    int ret;
+// static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
+// {
+//     int ret;
 
-    // Check if keyboard RGB is supported
-    ret = hp_omen_keyboard_check_support();
-    if (ret <= 0) {
-        pr_info("Keyboard RGB not supported or detection failed\n");
-        hp_omen_keyboard_rgb_support = false;
-        return 0; // Don't fail driver init if RGB not supported
-    }
+//     // Check if keyboard RGB is supported
+//     ret = hp_omen_keyboard_check_support();
+//     if (ret <= 0) {
+//         pr_info("Keyboard RGB not supported or detection failed\n");
+//         hp_omen_keyboard_rgb_support = false;
+//         return 0; // Don't fail driver init if RGB not supported
+//     }
 
-    hp_omen_keyboard_rgb_support = true;
-    pr_info("Keyboard RGB support detected\n");
+//     hp_omen_keyboard_rgb_support = true;
+//     pr_info("Keyboard RGB support detected\n");
 
-    // Create sysfs attribute group
-    ret = sysfs_create_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
-    if (ret) {
-        pr_err("Failed to create keyboard RGB sysfs attributes: %d\n", ret);
-        hp_omen_keyboard_rgb_support = false;
-        return ret;
-    }
+//     // Create sysfs attribute group
+//     ret = sysfs_create_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+//     if (ret) {
+//         pr_err("Failed to create keyboard RGB sysfs attributes: %d\n", ret);
+//         hp_omen_keyboard_rgb_support = false;
+//         return ret;
+//     }
 
-    pr_info("Keyboard RGB sysfs interface created\n");
-    return 0;
-}
+//     pr_info("Keyboard RGB sysfs interface created\n");
+//     return 0;
+// }
 
 /**
  * hp_omen_keyboard_rgb_remove - Clean up keyboard RGB support
  * Add this function call to hp_wmi_bios_remove()
  */
-static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
-{
-    if (hp_omen_keyboard_rgb_support) {
-        sysfs_remove_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
-    }
-}
+// static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
+// {
+//     if (hp_omen_keyboard_rgb_support) {
+//         sysfs_remove_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+//     }
+// }
 
 
 static ssize_t fan_unified_show(struct device *dev,
@@ -1650,6 +1650,15 @@ static ssize_t fan_unified_store(struct device *dev,
     return ret ? ret : count;
 }
 
+
+static ssize_t gpu_mux_state_show(struct device *dev,
+                                 struct device_attribute *attr,
+                                 char *buf);
+
+static ssize_t gpu_mux_state_store(struct device *dev,
+                                   struct device_attribute *attr,
+                                   const char *buf, size_t count);
+
 static DEVICE_ATTR_RW(fan_unified);
 
 static DEVICE_ATTR_RO(display);
@@ -1658,6 +1667,7 @@ static DEVICE_ATTR_RW(als);
 static DEVICE_ATTR_RO(dock);
 static DEVICE_ATTR_RO(tablet);
 static DEVICE_ATTR_RW(postcode);
+static DEVICE_ATTR_RW(gpu_mux_state);
 
 static struct attribute *hp_wmi_attrs[] = {
 	&dev_attr_display.attr,
@@ -1672,13 +1682,12 @@ static struct attribute *hp_wmi_attrs[] = {
 ATTRIBUTE_GROUPS(hp_wmi);
 
 static struct attribute *hp_wmi_mux_attrs[] = {
-    &dev_attr_gpu_mux_state.attr,
-    NULL,
+	&dev_attr_gpu_mux_state.attr,
+	NULL,
 };
-
 static const struct attribute_group hp_wmi_mux_attr_group = {
-    .name = "mux_switch",
-    .attrs = hp_wmi_mux_attrs,
+	.name = "mux_switch",
+	.attrs = hp_wmi_mux_attrs,
 };
 
 static void hp_wmi_notify(union acpi_object *obj, void *context)
@@ -2147,8 +2156,6 @@ static ssize_t gpu_mux_state_store(struct device *dev,
 
     return count;
 }
-
-static DEVICE_ATTR_RW(gpu_mux_state);
 
 static int hp_kbd_leds_init(struct platform_device *pdev)
 {
