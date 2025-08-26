@@ -797,6 +797,32 @@ static int hp_wmi_fan_speed_max_reset(void)
 	return ret;
 }
 
+// Enhanced automatic mode with proper EC reset
+static int hp_wmi_fan_enhanced_auto_mode(enum platform_profile_option profile)
+{
+    int ret;
+
+    // Step 1: Trigger user-defined mode (like OmenMon does)
+    ret = hp_wmi_get_fan_count_userdefine_trigger();
+    if (ret < 0) {
+        pr_warn("Failed to trigger user-defined mode: %d\n", ret);
+        // Continue anyway - fallback to standard reset
+    }
+
+    // Step 2: Use official kernel reset mechanism
+    ret = hp_wmi_fan_speed_max_reset();
+    if (ret) {
+        pr_warn("Failed to reset fan speed max: %d\n", ret);
+        return ret;
+    }
+
+    // Step 3: Set thermal profile (this applies appropriate fan curve/behavior)
+    // This will be handled by existing thermal profile functions
+    pr_info("Enhanced automatic mode activated for profile %d\n", profile);
+    
+    return 0;
+}
+
 static int hp_wmi_fan_speed_max_get(void)
 {
 	int val = 0, ret;
@@ -2043,22 +2069,33 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 		return -EINVAL;
     }
 
-    if (has_omen_thermal_profile_ec_timer()) {
-        err = omen_thermal_profile_ec_timer_set(0);
-        if (err < 0)
-            return err;
+	if (has_omen_thermal_profile_ec_timer()) {
+		err = omen_thermal_profile_ec_timer_set(0);
+		if (err < 0)
+			return err;
 
-        if (profile == PLATFORM_PROFILE_PERFORMANCE)
-            flags = HP_OMEN_EC_FLAGS_NOTIMER |
-                HP_OMEN_EC_FLAGS_TURBO;
+		if (profile == PLATFORM_PROFILE_PERFORMANCE)
+			flags = HP_OMEN_EC_FLAGS_NOTIMER |
+				HP_OMEN_EC_FLAGS_TURBO;
 
-        err = omen_thermal_profile_ec_flags_set(flags);
-        if (err < 0)
-            return err;
-    }
+		err = omen_thermal_profile_ec_flags_set(flags);
+		if (err < 0)
+			return err;
+	}
 
-    return 0;
+	// If fan is in automatic mode, reset EC and apply new profile
+	if (!unified_manual_mode) {
+		err = hp_wmi_fan_enhanced_auto_mode(profile);
+		if (err < 0) {
+			pr_warn("Failed to apply enhanced automatic mode: %d\n", err);
+			// Continue with standard behavior
+		}
+	}
+
+	return 0;
 }
+
+
 
 static int platform_profile_omen_set(struct device *dev,
 				     enum platform_profile_option profile)
@@ -2879,35 +2916,31 @@ static int hp_wmi_hwmon_write(struct device *dev,
             if (val < 0 || val > 255)
                 return -EINVAL;
 
-            /* 1) Fan off when pwm1 = 0 */
+            /* Fan off when pwm1 = 0 - Enhanced automatic with thermal profile awareness */
             if (val == 0) {
                 unified_manual_mode = false;
                 unified_fan_speed = -1;
-                return hp_wmi_fan_speed_set_unified(-1);
+                
+                // Use the official kernel reset mechanism + thermal profile awareness
+                return hp_wmi_fan_enhanced_auto_mode(active_platform_profile);
             }
 
-            /*
-             * 2) Enforce minimum idle PWM at ~36%
-             *    36% of 255 ≈ 92
-             */
+            /* Manual control - existing logic unchanged */
             const int min_pwm = (36 * 255) / 100;
             if (val < min_pwm)
                 val = min_pwm;
 
-            /* Clear any max-mode */
+            /* Clear any max-mode first */
             hp_wmi_fan_speed_max_set(0);
 
-            /*
-             * 3) Scale [min_pwm..255] → [0..100]% manual speed
-             */
             unified_manual_mode = true;
             unified_fan_speed = ((val - min_pwm) * 100) / (255 - min_pwm);
-            last_manual_speed   = unified_fan_speed;
+            last_manual_speed = unified_fan_speed;
 
             return hp_wmi_fan_speed_set_unified(unified_fan_speed);
         }
     }
-
+    
     return -EOPNOTSUPP;
 }
 
