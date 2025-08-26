@@ -373,7 +373,7 @@ static int hp_wmi_detect_max_fan_rpm(void)
 
     /* Force max mode, wait, read average, clamp */
     hp_wmi_fan_speed_max_set(1);
-    msleep(200);
+    msleep(2000);
     max_rpm = hp_wmi_fan_get_average_speed();
 
     /* Restore previous mode */
