@@ -352,6 +352,7 @@ static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
                                 void *buffer, int insize, int outsize);
 
 /* Forward-declare the existing static fan control functions */
+static int hp_wmi_fan_speed_reset(void);v
 static int hp_wmi_fan_speed_max_set(int enabled);
 static int hp_wmi_fan_speed_set_unified(int percentage);
 static int hp_wmi_fan_get_average_speed(void);
@@ -376,7 +377,7 @@ static int hp_wmi_detect_max_fan_rpm(void)
     max_rpm = hp_wmi_fan_get_average_speed();
 
     /* Restore previous mode */
-    hp_wmi_fan_speed_reset()
+    hp_wmi_fan_speed_reset();
 
     return detected_max_rpm = max_rpm;
 }
