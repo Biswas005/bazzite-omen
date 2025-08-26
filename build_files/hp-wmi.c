@@ -3149,9 +3149,7 @@ static int hp_wmi_enable_auto_fan_mode(void)
     int ret;
 
     // Disable max mode first
-    ret = hp_wmi_fan_speed_max_reset(); 
-    if (ret)
-        return ret;
+    ret = hp_wmi_fan_speed_max_reset();
 }
 
 
@@ -3409,8 +3407,8 @@ static int __init hp_wmi_init(void)
 	int event_capable = wmi_has_guid(HPWMI_EVENT_GUID);
 	int bios_capable = wmi_has_guid(HPWMI_BIOS_GUID);
 	int err, tmp = 0;
-	detected_max_rpm = -1;
-    hp_wmi_detect_max_fan_rpm();
+	// detected_max_rpm = -1;
+   // hp_wmi_detect_max_fan_rpm();
 
 	if (!bios_capable && !event_capable)
 		return -ENODEV;
