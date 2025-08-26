@@ -797,32 +797,6 @@ static int hp_wmi_fan_speed_max_reset(void)
 	return ret;
 }
 
-// Enhanced automatic mode with proper EC reset
-static int hp_wmi_fan_enhanced_auto_mode(enum platform_profile_option profile)
-{
-    int ret;
-
-    // Step 1: Trigger user-defined mode (like OmenMon does)
-    ret = hp_wmi_get_fan_count_userdefine_trigger();
-    if (ret < 0) {
-        pr_warn("Failed to trigger user-defined mode: %d\n", ret);
-        // Continue anyway - fallback to standard reset
-    }
-
-    // Step 2: Use official kernel reset mechanism
-    ret = hp_wmi_fan_speed_max_reset();
-    if (ret) {
-        pr_warn("Failed to reset fan speed max: %d\n", ret);
-        return ret;
-    }
-
-    // Step 3: Set thermal profile (this applies appropriate fan curve/behavior)
-    // This will be handled by existing thermal profile functions
-    pr_info("Enhanced automatic mode activated for profile %d\n", profile);
-    
-    return 0;
-}
-
 static int hp_wmi_fan_speed_max_get(void)
 {
 	int val = 0, ret;
@@ -2069,33 +2043,22 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 		return -EINVAL;
     }
 
-	if (has_omen_thermal_profile_ec_timer()) {
-		err = omen_thermal_profile_ec_timer_set(0);
-		if (err < 0)
-			return err;
+    if (has_omen_thermal_profile_ec_timer()) {
+        err = omen_thermal_profile_ec_timer_set(0);
+        if (err < 0)
+            return err;
 
-		if (profile == PLATFORM_PROFILE_PERFORMANCE)
-			flags = HP_OMEN_EC_FLAGS_NOTIMER |
-				HP_OMEN_EC_FLAGS_TURBO;
+        if (profile == PLATFORM_PROFILE_PERFORMANCE)
+            flags = HP_OMEN_EC_FLAGS_NOTIMER |
+                HP_OMEN_EC_FLAGS_TURBO;
 
-		err = omen_thermal_profile_ec_flags_set(flags);
-		if (err < 0)
-			return err;
-	}
+        err = omen_thermal_profile_ec_flags_set(flags);
+        if (err < 0)
+            return err;
+    }
 
-	// If fan is in automatic mode, reset EC and apply new profile
-	if (!unified_manual_mode) {
-		err = hp_wmi_fan_enhanced_auto_mode(profile);
-		if (err < 0) {
-			pr_warn("Failed to apply enhanced automatic mode: %d\n", err);
-			// Continue with standard behavior
-		}
-	}
-
-	return 0;
+    return 0;
 }
-
-
 
 static int platform_profile_omen_set(struct device *dev,
 				     enum platform_profile_option profile)
@@ -2777,6 +2740,75 @@ static const struct dev_pm_ops hp_wmi_pm_ops = {
  * runtime. So mark the driver struct with __refdata to prevent modpost
  * triggering a section mismatch warning.
  */
+// Use official 2-step reset sequence on enabling auto mode
+static int hp_wmi_enable_auto_fan_mode(void)
+{
+    int ret;
+
+    // Disable max mode first
+    ret = hp_wmi_fan_speed_max_set(0);
+    if (ret)
+        return ret;
+
+    // Reset to automatic speed
+    ret = hp_wmi_fan_speed_reset();
+    return ret;
+}
+
+
+// Convert user percentage 0-100 to PWM in safe model range
+static int hp_wmi_percentage_to_pwm(int percentage)
+{
+    int pwm_min = 0;  // model-specific min PWM
+    int pwm_max = 186;  // model-specific max PWM
+
+    if (percentage == 0)
+        return 0;  // auto mode disables manual PWM
+
+    if (percentage < 0)
+        percentage = 0;
+    if (percentage > 100)
+        percentage = 100;
+
+    return pwm_min + (percentage * (pwm_max - pwm_min)) / 100;
+}
+
+struct fan_curve_point {
+    u8 temp_c;
+    u8 pwm;
+};
+
+static const struct fan_curve_point omen_perf_curve[] = {
+    { 40, 120 },
+    { 50, 150 },
+    { 60, 180 },
+    { 70, 220 },
+    { 80, 255 },
+};
+
+static int apply_fan_curve(int cpu_temp)
+{
+    int i;
+    int pwm = 0;
+
+    for (i = 0; i < ARRAY_SIZE(omen_perf_curve) - 1; i++) {
+        if (cpu_temp >= omen_perf_curve[i].temp_c && cpu_temp < omen_perf_curve[i+1].temp_c) {
+            // linear interpolation for PWM
+            int range_temp = omen_perf_curve[i+1].temp_c - omen_perf_curve[i].temp_c;
+            int range_pwm = omen_perf_curve[i+1].pwm - omen_perf_curve[i].pwm;
+            int offset_temp = cpu_temp - omen_perf_curve[i].temp_c;
+            pwm = omen_perf_curve[i].pwm + (range_pwm * offset_temp) / range_temp;
+            break;
+        }
+    }
+    if (cpu_temp <= omen_perf_curve[0].temp_c)
+        pwm = omen_perf_curve[0].pwm;
+    if (cpu_temp >= omen_perf_curve[ARRAY_SIZE(omen_perf_curve) - 1].temp_c)
+        pwm = omen_perf_curve[ARRAY_SIZE(omen_perf_curve) - 1].pwm;
+
+    return pwm;
+}
+
 static struct platform_driver hp_wmi_driver __refdata = {
 	.driver = {
 		.name = "hp-wmi",
@@ -2910,37 +2942,25 @@ static int hp_wmi_hwmon_write(struct device *dev,
                               enum hwmon_sensor_types type,
                               u32 attr, int channel, long val)
 {
-    if (type == hwmon_pwm && channel == 0) {
-        if (attr == hwmon_pwm_input) {
-            /* Raw PWM duty: 0–255 */
-            if (val < 0 || val > 255)
-                return -EINVAL;
+    int pwm;
 
-            /* Fan off when pwm1 = 0 - Enhanced automatic with thermal profile awareness */
-            if (val == 0) {
-                unified_manual_mode = false;
-                unified_fan_speed = -1;
-                
-                // Use the official kernel reset mechanism + thermal profile awareness
-                return hp_wmi_fan_enhanced_auto_mode(active_platform_profile);
-            }
-
-            /* Manual control - existing logic unchanged */
-            const int min_pwm = (36 * 255) / 100;
-            if (val < min_pwm)
-                val = min_pwm;
-
-            /* Clear any max-mode first */
-            hp_wmi_fan_speed_max_set(0);
-
-            unified_manual_mode = true;
-            unified_fan_speed = ((val - min_pwm) * 100) / (255 - min_pwm);
-            last_manual_speed = unified_fan_speed;
-
-            return hp_wmi_fan_speed_set_unified(unified_fan_speed);
+    if (type == hwmon_pwm && channel == 0 && attr == hwmon_pwm_input) {
+        // Auto mode
+        if (val == 0) {
+            unified_manual_mode = false;
+            unified_fan_speed = -1;
+            hp_wmi_enable_auto_fan_mode();
+            return 0;
         }
+
+        // Manual mode, enforce min/max PWM safe ranges
+        pwm = hp_wmi_percentage_to_pwm(val);
+        unified_manual_mode = true;
+        unified_fan_speed = val;
+        last_manual_speed = val;
+
+        return hp_wmi_fan_speed_set_unified(val);
     }
-    
     return -EOPNOTSUPP;
 }
 
@@ -3089,7 +3109,3 @@ static int omen_set_gpu_power(const struct omen_power_profile *p)
 
 static struct delayed_work fan_mode_watcher_work;
 static int user_manual_fan = 0; // 0 = automatic, 1 = manual/max
-
-
-
-
