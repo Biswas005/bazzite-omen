@@ -93,7 +93,7 @@ jobs:
         id: build
         uses: ublue-os/bootc-image-builder-action@main
         with:
-          bootc-image-builder-image: quay.io/ublue-os/bootc-image-builder:latest
+          bootc-image-builder-image: quay.io/centos-bootc/bootc-image-builder:latest
           use-librepo: true
           rootfs: btrfs
           config-file: ./iso.toml
