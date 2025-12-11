@@ -395,40 +395,6 @@ gpgcheck=1
 gpgkey=https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
 BRAVE_REPO_EOF
 
-
-
-# Install Brave browser with more permissive RPM options
-if dnf5 install -y brave-browser --setopt=install_weak_deps=False; then
-    echo "✅ Brave Browser (RPM) installed successfully!"
-    BRAVE_INSTALLED=true
-else
-    echo "⚠️ Brave Browser (RPM) installation failed, trying alternative approach..."
-    BRAVE_INSTALLED=false
-    
-    # Alternative: Try installing from Flatpak as fallback
-    echo "Installing Brave Browser from Flatpak as fallback..."
-    if flatpak install -y flathub com.brave.Browser; then
-        echo "✅ Brave Browser (Flatpak) installed successfully as fallback!"
-        BRAVE_INSTALLED=true
-    else
-        echo "❌ Both RPM and Flatpak installation of Brave Browser failed"
-        echo "⚠️ Continuing without Brave Browser - you can install it manually later"
-        BRAVE_INSTALLED=false
-    fi
-fi
-
-# Only remove Flatpak version if RPM version was successfully installed
-if [ "$BRAVE_INSTALLED" = true ] && dnf5 list installed brave-browser &>/dev/null; then
-    # Remove Flatpak version of Brave (if installed and RPM version succeeded)
-    if flatpak list | grep -q com.brave.Browser; then
-        echo "Removing Flatpak version of Brave Browser (RPM version installed)..."
-        flatpak remove -y com.brave.Browser
-        echo "✅ Flatpak Brave Browser removed successfully!"
-    else
-        echo "ℹ️ No Flatpak version of Brave Browser found to remove."
-    fi
-fi
-
 # Enable services
 systemctl enable podman.socket
 
