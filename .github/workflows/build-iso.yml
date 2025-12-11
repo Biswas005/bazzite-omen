@@ -41,10 +41,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-   - name: Login to Quay.io
-        run: |
-          echo "${{ secrets.QUAY_PASSWORD }}" | podman login quay.io \
-            -u "${{ secrets.QUAY_USERNAME }}" --password-stdin
   build-iso:
     name: Build Bazzite-Omen ISO (${{ inputs.platform || 'amd64' }})
     runs-on: ${{ (inputs.platform == 'arm64' || matrix.platform == 'arm64') && 'ubuntu-24.04-arm64' || 'ubuntu-24.04' }}
@@ -71,6 +67,11 @@ jobs:
           set -x
           sudo apt update -y
           sudo apt install -y podman
+
+      - name: Login to Quay.io
+        run: |
+          echo "${{ secrets.QUAY_PASSWORD }}" | podman login quay.io \
+            -u "${{ secrets.QUAY_USERNAME }}" --password-stdin
 
       - name: Maximize build space (AMD64)
         if: matrix.platform != 'arm64'
@@ -99,6 +100,7 @@ jobs:
           image: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
           architecture: ${{ matrix.platform }}
 
+      
       - name: Move and rename ISO files
         if: steps.build.outcome == 'success'
         shell: bash
