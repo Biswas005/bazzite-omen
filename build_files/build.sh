@@ -377,25 +377,6 @@ VSCODE_REPO_EOF
 dnf5 install -y code
 echo "Visual Studio Code installed successfully!"
 
-echo "Installing Firefox (RPM)..."
-# Install Firefox from Fedora's repository
-dnf5 install -y firefox
-if [ $? -eq 0 ]; then
-    echo "✅ Firefox (RPM) installed successfully!"
-else
-    echo "❌ Failed to install Firefox (RPM)"
-    exit 1
-fi
-
-# Remove Flatpak version of Firefox (if installed)
-if flatpak list | grep -q org.mozilla.firefox; then
-    echo "Removing Flatpak version of Firefox..."
-    flatpak remove -y org.mozilla.firefox
-    echo "✅ Flatpak Firefox removed successfully!"
-else
-    echo "ℹ️ No Flatpak version of Firefox found, skipping removal."
-fi
-
 # Install Brave Browser
 ########################
 
