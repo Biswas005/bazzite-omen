@@ -1,4 +1,4 @@
-distro = "fedora-41"
+distro = "fedora-43"
 
 [customizations.installer.kickstart]
 contents = """
