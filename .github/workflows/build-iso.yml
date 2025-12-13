@@ -96,7 +96,7 @@ jobs:
 
       - name: Download Terra Mesa GPG Key
         run: |
-          curl -o ./keys/RPM-GPG-KEY-terra43-mesa https://repos.fyralabs.com/terra43-mesa/key.asc || { echo "Key download failed; check URL or use fedora-42" >&2; exit 1; }
+          curl -o ./keys/RPM-GPG-KEY-terra42-mesa https://repos.fyralabs.com/terra42-mesa/key.asc || { echo "Key download failed; check URL or use fedora-42" >&2; exit 1; }
 
       - name: Pull required images
         run: |
