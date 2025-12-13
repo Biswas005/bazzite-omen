@@ -1,4 +1,4 @@
-distro = "fedora-43"  # Try "fedora-42" if Anaconda pull fails later
+distro = "fedora-42"  # Try "fedora-42" if Anaconda pull fails later
 
 [customizations.installer.modules]
 enable = [
