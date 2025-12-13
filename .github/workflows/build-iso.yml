@@ -85,10 +85,11 @@ jobs:
             exit 1
           fi
 
-      - name: Prepare output directory
+      - name: Prepare directories
         run: |
           sudo rm -rf /var/lib/containers/storage
-          sudo mkdir -p /var/lib/containers/storage /etc/containers ./output
+          sudo mkdir -p /var/lib/containers/storage /etc/containers
+          mkdir -p ./output ./keys/etc/pki  # User-owned for write access
           echo '[storage]
           driver = "overlay"
           runroot = "/run/containers/storage"
@@ -99,6 +100,12 @@ jobs:
           sudo podman pull ${{ env.BUILDER_IMAGE }}
           sudo podman pull ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
 
+      - name: Extract GPG keys from base image
+        run: |
+          CONTAINER=$(sudo podman create ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }})
+          sudo podman cp $CONTAINER:/etc/pki/rpm-gpg ./keys/etc/pki/ || { echo "GPG keys not found in image; build may fail on repo metadata" >&2; }
+          sudo podman rm $CONTAINER
+
       - name: Build Bazzite-Omen ISO (manual)
         id: build
         run: |
@@ -106,9 +113,9 @@ jobs:
             --volume /var/lib/containers/storage:/var/lib/containers/storage \
             --volume ./output:/output \
             --volume ./iso.toml:/config.toml:ro \
+            --volume ./keys/etc/pki/rpm-gpg:/etc/pki/rpm-gpg:ro \
             ${{ env.BUILDER_IMAGE }} build \
             --output /output --rootfs btrfs --target-arch ${{ env.ARCH }} --type iso \
-            --additional-args "--setopt=gpgcheck=0" \
             ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
           echo "output-directory=$(pwd)/output" >> $GITHUB_OUTPUT
 
@@ -128,9 +135,6 @@ jobs:
             exit 1
           fi
         id: rename
-
-      # (Rest of steps: Upload artifacts, S3, summary - unchanged from previous)
-
 
       - name: Upload ISO to Job Artifacts
         if: steps.build.outcome == 'success' && inputs.upload-to-s3 != true
