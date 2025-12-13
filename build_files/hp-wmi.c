@@ -36,7 +36,7 @@
 #include <linux/leds.h>
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
-MODULE_DESCRIPTION("HP laptop WMI driver");
+MODULE_DESCRIPTION("HP laptop WMI Extras (Omen: Unified fan control via pwm1 % duty; syncs to power profiles)");
 MODULE_LICENSE("GPL");
 
 MODULE_ALIAS("wmi:95F24279-4D7B-4334-9387-ACCDC67EF61C");
@@ -365,15 +365,65 @@ static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
                                 void *buffer, int insize, int outsize);
 
 /* Forward-declare the existing static fan control functions */
-static int hp_wmi_fan_speed_reset(void);
+static int hp_wmi_fan_speed_get(int fan);
+static int hp_wmi_get_fan_speed_victus_s(int fan);
+static int hp_wmi_fan_speed_set_query(u8 *fan_data, int size);
+static int hp_wmi_fan_speed_max_get(void);
 static int hp_wmi_fan_speed_max_set(int enabled);
-static int hp_wmi_fan_speed_set_unified(int percentage);
-static int hp_wmi_fan_get_average_speed(void);
+static int hp_wmi_fan_speed_reset(void);
 
-/* Our new helpers to detect and cache max RPM */
-static int detected_max_rpm = -1;
-static int hp_wmi_detect_max_fan_rpm(void);
-static int hp_wmi_get_max_fan_rpm(void);
+struct hp_wmi_data {
+    u8 thermal_profile;
+    bool manual_mode;
+    u8 max_rpm_div100;  // Cached max RPM/100
+    struct notifier_block ac_nb;
+    struct notifier_block pm_nb;
+};
+
+static struct hp_wmi_data *hp_priv;
+
+static bool ac_online = true;
+
+// AC notifier callback
+static int hp_wmi_ac_notify(struct notifier_block *nb, unsigned long event, void *p)
+{
+    struct power_supply *psy = p;
+    union power_supply_propval val = {0};
+    struct hp_wmi_data *data = container_of(nb, struct hp_wmi_data, ac_nb);
+
+    if (event != PSY_EVENT_PROP_CHANGED || !psy || strcmp(psy->desc->name, "AC"))
+        return NOTIFY_DONE;
+    if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val))
+        ac_online = !!val.intval;
+    hp_wmi_set_thermal_profile(data, ac_online ? HP_THERMAL_PROFILE_PERFORMANCE : HP_THERMAL_PROFILE_DEFAULT);
+    return NOTIFY_OK;
+}
+
+// PM notifier for wake/resume
+static int hp_wmi_pm_notify(struct notifier_block *nb, unsigned long mode, void *unused)
+{
+    if (mode != PM_POST_SUSPEND)
+        return NOTIFY_OK;
+    struct hp_wmi_data *data = container_of(nb, struct hp_wmi_data, pm_nb);
+    int profile;
+    if (!platform_profile_get(&profile))
+        profile = PLATFORM_PROFILE_BALANCED;
+    enum hp_thermal_profile thermal = (profile == PLATFORM_PROFILE_PERFORMANCE) ?
+        HP_THERMAL_PROFILE_PERFORMANCE : HP_THERMAL_PROFILE_DEFAULT;
+    hp_wmi_set_thermal_profile(data, thermal);
+    if (!data->manual_mode) {
+        u8 auto_mode = HP_FAN_SPEED_AUTOMATIC;
+        hp_wmi_perform_query(data, HPWMI_GM, HPWMI_FAN_SPEED_SET_QUERY, &auto_mode, 1, 0);
+    }
+    return NOTIFY_OK;
+}
+
+// Thermal set fn (streamlined)
+static int hp_wmi_set_thermal_profile(struct hp_wmi_data *data, enum hp_thermal_profile profile)
+{
+    u8 cmd = profile;
+    return hp_wmi_perform_query(data, HPWMI_GM, HPWMI_THERMAL_PROFILE_SET_QUERY, &cmd, 1, 0);
+}
 
 static int hp_omen_keyboard_set_colors(const struct hp_omen_keyboard_colors *colors);
 
@@ -1572,453 +1622,219 @@ static const struct attribute_group hp_wmi_keyboard_attr_group = {
 //     // Create sysfs attribute group
 //     ret = sysfs_create_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
 //     if (ret) {
-//         pr_err("Failed to create keyboard RGB sysfs attributes: %d\n", ret);
-//         hp_omen_keyboard_rgb_support = false;
-//         return ret;
-//     }
+//         pr_err("Failed to create keyboar...(truncated 6382 characters)...rt_switch(hp_wmi_input_dev, SW_DOCK, val);
+//	}
 
-//     pr_info("Keyboard RGB sysfs interface created\n");
-//     return 0;
-// }
+//	/* Tablet mode */
+//	val = hp_wmi_get_tablet_mode();
+//	if (!(val < 0)) {
+//		__set_bit(SW_TABLET_MODE, hp_wmi_input_dev->swbit);
+//		input_report_switch(hp_wmi_input_dev, SW_TABLET_MODE, val);
+//	}
 
-/**
- * hp_omen_keyboard_rgb_remove - Clean up keyboard RGB support
- * Add this function call to hp_wmi_bios_remove()
- */
-// static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
-// {
-//     if (hp_omen_keyboard_rgb_support) {
-//         sysfs_remove_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
-//     }
-// }
+//	err = sparse_keymap_setup(hp_wmi_input_dev, hp_wmi_keymap, NULL);
+//	if (err)
+//		goto err_free_dev;
 
+//	/* Set initial hardware state */
+//	input_sync(hp_wmi_input_dev);
 
-static ssize_t fan_unified_show(struct device *dev,
-                                struct device_attribute *attr,
-                                char *buf)
-{
-    int cpu_rpm, gpu_rpm, avg_rpm;
-    
-    if (is_victus_s_thermal_profile()) {
-        cpu_rpm = hp_wmi_get_fan_speed_victus_s(0);
-        gpu_rpm = hp_wmi_get_fan_speed_victus_s(1);
-    } else {
-        cpu_rpm = hp_wmi_get_fan_speed(0);
-        gpu_rpm = hp_wmi_get_fan_speed(1);
-    }
-    
-    avg_rpm = hp_wmi_fan_get_average_speed();
-    
-    return sprintf(buf, "Mode: %s\nSpeed: %d%%\nCPU: %d RPM\nGPU: %d RPM\nAverage: %d RPM\n",
-                   unified_manual_mode ? "Manual" : "Auto",
-                   unified_manual_mode ? unified_fan_speed : -1,
-                   cpu_rpm >= 0 ? cpu_rpm : 0,
-                   gpu_rpm >= 0 ? gpu_rpm : 0, 
-                   avg_rpm >= 0 ? avg_rpm : 0);
-}
+//	if (!hp_wmi_bios_2009_later() && hp_wmi_bios_2008_later())
+//		hp_wmi_enable_hotkeys();
 
-static ssize_t fan_unified_store(struct device *dev,
-                                 struct device_attribute *attr,
-                                 const char *buf, size_t count)
-{
-    int percentage;
-    int ret;
-    
-    if (strncmp(buf, "auto", 4) == 0 || strncmp(buf, "automatic", 9) == 0) {
-        ret = hp_wmi_fan_speed_set_unified(-1);  // Auto
-    } else {
-        ret = kstrtoint(buf, 0, &percentage);
-        if (ret)
-            return ret;
-            
-        if (percentage < 0 || percentage > 100)
-            return -EINVAL;
-            
-        ret = hp_wmi_fan_speed_set_unified(percentage);
-    }
-    
-    return ret ? ret : count;
-}
+//	status = wmi_install_notify_handler(HPWMI_EVENT_GUID, hp_wmi_notify, NULL);
+//	if (ACPI_FAILURE(status)) {
+//		err = -EIO;
+//		goto err_free_dev;
+//	}
 
-static DEVICE_ATTR_RW(fan_unified);
+//	err = input_register_device(hp_wmi_input_dev);
+//	if (err)
+//		goto err_uninstall_notifier;
 
-static DEVICE_ATTR_RO(display);
-static DEVICE_ATTR_RO(hddtemp);
-static DEVICE_ATTR_RW(als);
-static DEVICE_ATTR_RO(dock);
-static DEVICE_ATTR_RO(tablet);
-static DEVICE_ATTR_RW(postcode);
+//	return 0;
 
-static struct attribute *hp_wmi_attrs[] = {
-	&dev_attr_display.attr,
-	&dev_attr_hddtemp.attr,
-	&dev_attr_als.attr,
-	&dev_attr_dock.attr,
-	&dev_attr_tablet.attr,
-	&dev_attr_postcode.attr,
-	&dev_attr_fan_unified.attr,
-	NULL,
-};
-ATTRIBUTE_GROUPS(hp_wmi);
+// err_uninstall_notifier:
+//	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
+// err_free_dev:
+//	input_free_device(hp_wmi_input_dev);
+//	return err;
+//}
 
-static void hp_wmi_notify(union acpi_object *obj, void *context)
-{
-	u32 event_id, event_data;
-	u32 *location;
-	int key_code;
+//static void hp_wmi_input_destroy(void)
+//{
+//	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
+//	input_unregister_device(hp_wmi_input_dev);
+//}
 
-	if (!obj)
-		return;
-	if (obj->type != ACPI_TYPE_BUFFER) {
-		pr_info("Unknown response received %d\n", obj->type);
-		return;
-	}
+//static int __init hp_wmi_rfkill_setup(struct platform_device *device)
+//{
+//	int err, wireless;
 
-	/*
-	 * Depending on ACPI version the concatenation of id and event data
-	 * inside _WED function will result in a 8 or 16 byte buffer.
-	 */
-	location = (u32 *)obj->buffer.pointer;
-	if (obj->buffer.length == 8) {
-		event_id = *location;
-		event_data = *(location + 1);
-	} else if (obj->buffer.length == 16) {
-		event_id = *location;
-		event_data = *(location + 2);
-	} else {
-		pr_info("Unknown buffer length %d\n", obj->buffer.length);
-		return;
-	}
+//	wireless = hp_wmi_read_int(HPWMI_WIRELESS_QUERY);
+//	if (wireless < 0)
+//		return wireless;
 
-	switch (event_id) {
-	case HPWMI_DOCK_EVENT:
-		if (test_bit(SW_DOCK, hp_wmi_input_dev->swbit))
-			input_report_switch(hp_wmi_input_dev, SW_DOCK,
-					    hp_wmi_get_dock_state());
-		if (test_bit(SW_TABLET_MODE, hp_wmi_input_dev->swbit))
-			input_report_switch(hp_wmi_input_dev, SW_TABLET_MODE,
-					    hp_wmi_get_tablet_mode());
-		input_sync(hp_wmi_input_dev);
-		break;
-	case HPWMI_PARK_HDD:
-		break;
-	case HPWMI_SMART_ADAPTER:
-		break;
-	case HPWMI_BEZEL_BUTTON:
-		key_code = hp_wmi_read_int(HPWMI_HOTKEY_QUERY);
-		if (key_code < 0)
-			break;
+//	err = hp_wmi_perform_query(HPWMI_WIRELESS_QUERY, HPWMI_WRITE, &wireless,
+//				   sizeof(wireless), 0);
+//	if (err)
+//		return err;
 
-		if (!sparse_keymap_report_event(hp_wmi_input_dev,
-						key_code, 1, true))
-			pr_info("Unknown key code - 0x%x\n", key_code);
-		break;
-	case HPWMI_OMEN_KEY:
-		if (event_data) /* Only should be true for HP Omen */
-			key_code = event_data;
-		else
-			key_code = hp_wmi_read_int(HPWMI_HOTKEY_QUERY);
+//	if (wireless & 0x1) {
+//		wifi_rfkill = rfkill_alloc("hp-wifi", &device->dev,
+//					   RFKILL_TYPE_WLAN,
+//					   &hp_wmi_rfkill_ops,
+//					   (void *) HPWMI_WIFI);
+//		if (!wifi_rfkill)
+//			return -ENOMEM;
+//		rfkill_init_sw_state(wifi_rfkill,
+//				     hp_wmi_get_sw_state(HPWMI_WIFI));
+//		rfkill_set_hw_state(wifi_rfkill,
+//				    hp_wmi_get_hw_state(HPWMI_WIFI));
+//		err = rfkill_register(wifi_rfkill);
+//		if (err)
+//			goto register_wifi_error;
+//	}
 
-		if (!sparse_keymap_report_event(hp_wmi_input_dev,
-						key_code, 1, true))
-			pr_info("Unknown key code - 0x%x\n", key_code);
-		break;
-	case HPWMI_WIRELESS:
-		if (rfkill2_count) {
-			hp_wmi_rfkill2_refresh();
-			break;
-		}
+//	if (wireless & 0x2) {
+//		bluetooth_rfkill = rfkill_alloc("hp-bluetooth", &device->dev,
+//						RFKILL_TYPE_BLUETOOTH,
+//						&hp_wmi_rfkill_ops,
+//						(void *) HPWMI_BLUETOOTH);
+//		if (!bluetooth_rfkill) {
+//			err = -ENOMEM;
+//			goto register_bluetooth_error;
+//		}
+//		rfkill_init_sw_state(bluetooth_rfkill,
+//				     hp_wmi_get_sw_state(HPWMI_BLUETOOTH));
+//		rfkill_set_hw_state(bluetooth_rfkill,
+//				    hp_wmi_get_hw_state(HPWMI_BLUETOOTH));
+//		err = rfkill_register(bluetooth_rfkill);
+//		if (err)
+//			goto register_bluetooth_error;
+//	}
 
-		if (wifi_rfkill)
-			rfkill_set_states(wifi_rfkill,
-					  hp_wmi_get_sw_state(HPWMI_WIFI),
-					  hp_wmi_get_hw_state(HPWMI_WIFI));
-		if (bluetooth_rfkill)
-			rfkill_set_states(bluetooth_rfkill,
-					  hp_wmi_get_sw_state(HPWMI_BLUETOOTH),
-					  hp_wmi_get_hw_state(HPWMI_BLUETOOTH));
-		if (wwan_rfkill)
-			rfkill_set_states(wwan_rfkill,
-					  hp_wmi_get_sw_state(HPWMI_WWAN),
-					  hp_wmi_get_hw_state(HPWMI_WWAN));
-		break;
-	case HPWMI_CPU_BATTERY_THROTTLE:
-		pr_info("Unimplemented CPU throttle because of 3 Cell battery event detected\n");
-		break;
-	case HPWMI_LOCK_SWITCH:
-		break;
-	case HPWMI_LID_SWITCH:
-		break;
-	case HPWMI_SCREEN_ROTATION:
-		break;
-	case HPWMI_COOLSENSE_SYSTEM_MOBILE:
-		break;
-	case HPWMI_COOLSENSE_SYSTEM_HOT:
-		break;
-	case HPWMI_PROXIMITY_SENSOR:
-		break;
-	case HPWMI_BACKLIT_KB_BRIGHTNESS:
-		break;
-	case HPWMI_PEAKSHIFT_PERIOD:
-		break;
-	case HPWMI_BATTERY_CHARGE_PERIOD:
-		break;
-	case HPWMI_SANITIZATION_MODE:
-		break;
-	case HPWMI_CAMERA_TOGGLE:
-		if (!camera_shutter_input_dev)
-			if (camera_shutter_input_setup()) {
-				pr_err("Failed to setup camera shutter input device\n");
-				break;
-			}
-		if (event_data == 0xff)
-			input_report_switch(camera_shutter_input_dev, SW_CAMERA_LENS_COVER, 1);
-		else if (event_data == 0xfe)
-			input_report_switch(camera_shutter_input_dev, SW_CAMERA_LENS_COVER, 0);
-		else
-			pr_warn("Unknown camera shutter state - 0x%x\n", event_data);
-		input_sync(camera_shutter_input_dev);
-		break;
-	case HPWMI_SMART_EXPERIENCE_APP:
-		break;
-	default:
-		pr_info("Unknown event_id - %d - 0x%x\n", event_id, event_data);
-		break;
-	}
-}
+//	if (wireless & 0x4) {
+//		wwan_rfkill = rfkill_alloc("hp-wwan", &device->dev,
+//					   RFKILL_TYPE_WWAN,
+//					   &hp_wmi_rfkill_ops,
+//					   (void *) HPWMI_WWAN);
+//		if (!wwan_rfkill) {
+//			err = -ENOMEM;
+//			goto register_wwan_error;
+//		}
+//		rfkill_init_sw_state(wwan_rfkill,
+//				     hp_wmi_get_sw_state(HPWMI_WWAN));
+//		rfkill_set_hw_state(wwan_rfkill,
+//				    hp_wmi_get_hw_state(HPWMI_WWAN));
+//		err = rfkill_register(wwan_rfkill);
+//		if (err)
+//			goto register_wwan_error;
+//	}
 
-static int __init hp_wmi_input_setup(void)
-{
-	acpi_status status;
-	int err, val;
+//	return 0;
 
-	hp_wmi_input_dev = input_allocate_device();
-	if (!hp_wmi_input_dev)
-		return -ENOMEM;
+//register_wwan_error:
+//	rfkill_destroy(wwan_rfkill);
+//	wwan_rfkill = NULL;
+//	if (bluetooth_rfkill)
+//		rfkill_unregister(bluetooth_rfkill);
+//register_bluetooth_error:
+//	rfkill_destroy(bluetooth_rfkill);
+//	bluetooth_rfkill = NULL;
+//	if (wifi_rfkill)
+//		rfkill_unregister(wifi_rfkill);
+//register_wifi_error:
+//	rfkill_destroy(wifi_rfkill);
+//	wifi_rfkill = NULL;
+//	return err;
+//}
 
-	hp_wmi_input_dev->name = "HP WMI hotkeys";
-	hp_wmi_input_dev->phys = "wmi/input0";
-	hp_wmi_input_dev->id.bustype = BUS_HOST;
+//static int __init hp_wmi_rfkill2_setup(struct platform_device *device)
+//{
+//	struct bios_rfkill2_state state;
+//	int err, i;
 
-	__set_bit(EV_SW, hp_wmi_input_dev->evbit);
+//	err = hp_wmi_perform_query(HPWMI_WIRELESS2_QUERY, HPWMI_READ, &state,
+//				   zero_if_sup(state), sizeof(state));
+//	if (err)
+//		return err < 0 ? err : -EINVAL;
 
-	/* Dock */
-	val = hp_wmi_get_dock_state();
-	if (!(val < 0)) {
-		__set_bit(SW_DOCK, hp_wmi_input_dev->swbit);
-		input_report_switch(hp_wmi_input_dev, SW_DOCK, val);
-	}
+//	if (state.count > HPWMI_MAX_RFKILL2_DEVICES) {
+//		pr_warn("unable to parse 0x1b query output\n");
+//		return -EINVAL;
+//	}
 
-	/* Tablet mode */
-	val = hp_wmi_get_tablet_mode();
-	if (!(val < 0)) {
-		__set_bit(SW_TABLET_MODE, hp_wmi_input_dev->swbit);
-		input_report_switch(hp_wmi_input_dev, SW_TABLET_MODE, val);
-	}
+//	for (i = 0; i < state.count; i++) {
+//		struct rfkill *rfkill;
+//		enum rfkill_type type;
+//		char *name;
 
-	err = sparse_keymap_setup(hp_wmi_input_dev, hp_wmi_keymap, NULL);
-	if (err)
-		goto err_free_dev;
+//		switch (state.device[i].radio_type) {
+//		case HPWMI_WIFI:
+//			type = RFKILL_TYPE_WLAN;
+//			name = "hp-wifi";
+//			break;
+//		case HPWMI_BLUETOOTH:
+//			type = RFKILL_TYPE_BLUETOOTH;
+//			name = "hp-bluetooth";
+//			break;
+//		case HPWMI_WWAN:
+//			type = RFKILL_TYPE_WWAN;
+//			name = "hp-wwan";
+//			break;
+//		case HPWMI_GPS:
+//			type = RFKILL_TYPE_GPS;
+//			name = "hp-gps";
+//			break;
+//		default:
+//			pr_warn("unknown device type 0x%x\n",
+//				state.device[i].radio_type);
+//			continue;
+//		}
 
-	/* Set initial hardware state */
-	input_sync(hp_wmi_input_dev);
+//		if (!state.device[i].vendor_id) {
+//			pr_warn("zero device %d while %d reported\n",
+//				i, state.count);
+//			continue;
+//		}
 
-	if (!hp_wmi_bios_2009_later() && hp_wmi_bios_2008_later())
-		hp_wmi_enable_hotkeys();
+//		rfkill = rfkill_alloc(name, &device->dev, type,
+//				      &hp_wmi_rfkill2_ops, (void *)(long)i);
+//		if (!rfkill) {
+//			err = -ENOMEM;
+//			goto fail;
+//		}
 
-	status = wmi_install_notify_handler(HPWMI_EVENT_GUID, hp_wmi_notify, NULL);
-	if (ACPI_FAILURE(status)) {
-		err = -EIO;
-		goto err_free_dev;
-	}
+//		rfkill2[rfkill2_count].id = state.device[i].rfkill_id;
+//		rfkill2[rfkill2_count].num = i;
+//		rfkill2[rfkill2_count].rfkill = rfkill;
 
-	err = input_register_device(hp_wmi_input_dev);
-	if (err)
-		goto err_uninstall_notifier;
+//		rfkill_init_sw_state(rfkill,
+//				     IS_SWBLOCKED(state.device[i].power));
+//		rfkill_set_hw_state(rfkill,
+//				    IS_HWBLOCKED(state.device[i].power));
 
-	return 0;
+//		if (!(state.device[i].power & HPWMI_POWER_BIOS))
+//			pr_info("device %s blocked by BIOS\n", name);
 
- err_uninstall_notifier:
-	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
- err_free_dev:
-	input_free_device(hp_wmi_input_dev);
-	return err;
-}
+//		err = rfkill_register(rfkill);
+//		if (err) {
+//			rfkill_destroy(rfkill);
+//			goto fail;
+//		}
 
-static void hp_wmi_input_destroy(void)
-{
-	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
-	input_unregister_device(hp_wmi_input_dev);
-}
+//		rfkill2_count++;
+//	}
 
-static int __init hp_wmi_rfkill_setup(struct platform_device *device)
-{
-	int err, wireless;
-
-	wireless = hp_wmi_read_int(HPWMI_WIRELESS_QUERY);
-	if (wireless < 0)
-		return wireless;
-
-	err = hp_wmi_perform_query(HPWMI_WIRELESS_QUERY, HPWMI_WRITE, &wireless,
-				   sizeof(wireless), 0);
-	if (err)
-		return err;
-
-	if (wireless & 0x1) {
-		wifi_rfkill = rfkill_alloc("hp-wifi", &device->dev,
-					   RFKILL_TYPE_WLAN,
-					   &hp_wmi_rfkill_ops,
-					   (void *) HPWMI_WIFI);
-		if (!wifi_rfkill)
-			return -ENOMEM;
-		rfkill_init_sw_state(wifi_rfkill,
-				     hp_wmi_get_sw_state(HPWMI_WIFI));
-		rfkill_set_hw_state(wifi_rfkill,
-				    hp_wmi_get_hw_state(HPWMI_WIFI));
-		err = rfkill_register(wifi_rfkill);
-		if (err)
-			goto register_wifi_error;
-	}
-
-	if (wireless & 0x2) {
-		bluetooth_rfkill = rfkill_alloc("hp-bluetooth", &device->dev,
-						RFKILL_TYPE_BLUETOOTH,
-						&hp_wmi_rfkill_ops,
-						(void *) HPWMI_BLUETOOTH);
-		if (!bluetooth_rfkill) {
-			err = -ENOMEM;
-			goto register_bluetooth_error;
-		}
-		rfkill_init_sw_state(bluetooth_rfkill,
-				     hp_wmi_get_sw_state(HPWMI_BLUETOOTH));
-		rfkill_set_hw_state(bluetooth_rfkill,
-				    hp_wmi_get_hw_state(HPWMI_BLUETOOTH));
-		err = rfkill_register(bluetooth_rfkill);
-		if (err)
-			goto register_bluetooth_error;
-	}
-
-	if (wireless & 0x4) {
-		wwan_rfkill = rfkill_alloc("hp-wwan", &device->dev,
-					   RFKILL_TYPE_WWAN,
-					   &hp_wmi_rfkill_ops,
-					   (void *) HPWMI_WWAN);
-		if (!wwan_rfkill) {
-			err = -ENOMEM;
-			goto register_wwan_error;
-		}
-		rfkill_init_sw_state(wwan_rfkill,
-				     hp_wmi_get_sw_state(HPWMI_WWAN));
-		rfkill_set_hw_state(wwan_rfkill,
-				    hp_wmi_get_hw_state(HPWMI_WWAN));
-		err = rfkill_register(wwan_rfkill);
-		if (err)
-			goto register_wwan_error;
-	}
-
-	return 0;
-
-register_wwan_error:
-	rfkill_destroy(wwan_rfkill);
-	wwan_rfkill = NULL;
-	if (bluetooth_rfkill)
-		rfkill_unregister(bluetooth_rfkill);
-register_bluetooth_error:
-	rfkill_destroy(bluetooth_rfkill);
-	bluetooth_rfkill = NULL;
-	if (wifi_rfkill)
-		rfkill_unregister(wifi_rfkill);
-register_wifi_error:
-	rfkill_destroy(wifi_rfkill);
-	wifi_rfkill = NULL;
-	return err;
-}
-
-static int __init hp_wmi_rfkill2_setup(struct platform_device *device)
-{
-	struct bios_rfkill2_state state;
-	int err, i;
-
-	err = hp_wmi_perform_query(HPWMI_WIRELESS2_QUERY, HPWMI_READ, &state,
-				   zero_if_sup(state), sizeof(state));
-	if (err)
-		return err < 0 ? err : -EINVAL;
-
-	if (state.count > HPWMI_MAX_RFKILL2_DEVICES) {
-		pr_warn("unable to parse 0x1b query output\n");
-		return -EINVAL;
-	}
-
-	for (i = 0; i < state.count; i++) {
-		struct rfkill *rfkill;
-		enum rfkill_type type;
-		char *name;
-
-		switch (state.device[i].radio_type) {
-		case HPWMI_WIFI:
-			type = RFKILL_TYPE_WLAN;
-			name = "hp-wifi";
-			break;
-		case HPWMI_BLUETOOTH:
-			type = RFKILL_TYPE_BLUETOOTH;
-			name = "hp-bluetooth";
-			break;
-		case HPWMI_WWAN:
-			type = RFKILL_TYPE_WWAN;
-			name = "hp-wwan";
-			break;
-		case HPWMI_GPS:
-			type = RFKILL_TYPE_GPS;
-			name = "hp-gps";
-			break;
-		default:
-			pr_warn("unknown device type 0x%x\n",
-				state.device[i].radio_type);
-			continue;
-		}
-
-		if (!state.device[i].vendor_id) {
-			pr_warn("zero device %d while %d reported\n",
-				i, state.count);
-			continue;
-		}
-
-		rfkill = rfkill_alloc(name, &device->dev, type,
-				      &hp_wmi_rfkill2_ops, (void *)(long)i);
-		if (!rfkill) {
-			err = -ENOMEM;
-			goto fail;
-		}
-
-		rfkill2[rfkill2_count].id = state.device[i].rfkill_id;
-		rfkill2[rfkill2_count].num = i;
-		rfkill2[rfkill2_count].rfkill = rfkill;
-
-		rfkill_init_sw_state(rfkill,
-				     IS_SWBLOCKED(state.device[i].power));
-		rfkill_set_hw_state(rfkill,
-				    IS_HWBLOCKED(state.device[i].power));
-
-		if (!(state.device[i].power & HPWMI_POWER_BIOS))
-			pr_info("device %s blocked by BIOS\n", name);
-
-		err = rfkill_register(rfkill);
-		if (err) {
-			rfkill_destroy(rfkill);
-			goto fail;
-		}
-
-		rfkill2_count++;
-	}
-
-	return 0;
-fail:
-	for (; rfkill2_count > 0; rfkill2_count--) {
-		rfkill_unregister(rfkill2[rfkill2_count - 1].rfkill);
-		rfkill_destroy(rfkill2[rfkill2_count - 1].rfkill);
-	}
-	return err;
-}
+//	return 0;
+//fail:
+//	for (; rfkill2_count > 0; rfkill2_count--) {
+//		rfkill_unregister(rfkill2[rfkill2_count - 1].rfkill);
+//		rfkill_destroy(rfkill2[rfkill2_count - 1].rfkill);
+//	}
+//	return err;
+//}
 
 // OMEN power/fan profile table
 struct omen_power_profile {
@@ -2169,7 +1985,7 @@ static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
         return ret;
     }
 
-    // Initialize LED class devices for OpenRGB compatibility
+    // Initialize LED class devices
     ret = hp_kbd_leds_init(device);
     if (ret) {
         pr_warn("Failed to initialize keyboard LED devices: %d\n", ret);
