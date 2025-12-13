@@ -3202,3 +3202,254 @@ static int omen_set_gpu_power(const struct omen_power_profile *p)
 
 static struct delayed_work fan_mode_watcher_work;
 static int user_manual_fan = 0; // 0 = automatic, 1 = manual/max
+
+// Cached max RPM (queried once at probe)
+static int cached_max_rpm = -1;
+
+// Query max fan RPM (used for scaling pwm1 % → actual RPM)
+static int hp_wmi_query_max_rpm(void)
+{
+    u8 max_val = 0;
+    int ret;
+
+    ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_GET_QUERY, HPWMI_GM,
+                               &max_val, zero_if_sup(max_val), sizeof(max_val));
+    if (ret)
+        return 6000; // Safe fallback ~6000 RPM
+
+    return max_val * 100;
+}
+
+// Get cached or query max RPM
+static int hp_wmi_get_max_rpm(void)
+{
+    if (cached_max_rpm < 0)
+        cached_max_rpm = hp_wmi_query_max_rpm();
+    return cached_max_rpm;
+}
+
+// Unified average fan speed (RPM)
+static int hp_wmi_get_avg_rpm(void)
+{
+    int cpu = hp_wmi_get_fan_speed(0);
+    int gpu = hp_wmi_get_fan_speed(1);
+
+    if (cpu < 0) return gpu > 0 ? gpu : 0;
+    if (gpu < 0) return cpu;
+    return (cpu + gpu) / 2;
+}
+
+// HWMON: pwm1_enable (0=max, 1=manual %, 2=auto)
+static umode_t hp_wmi_hwmon_is_visible(const void *data,
+                                      enum hwmon_sensor_types type,
+                                      u32 attr, int channel)
+{
+    if (type == hwmon_pwm) {
+        if (channel != 0) return 0;
+        return 0644;
+    }
+    if (type == hwmon_fan) {
+        if (channel > 2) return 0;
+        return 0444;
+    }
+    return 0;
+}
+
+static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
+                            u32 attr, int channel, long *val)
+{
+    if (type == hwmon_fan) {
+        if (channel == 0) {
+            *val = hp_wmi_get_fan_speed(0);
+        } else if (channel == 1) {
+            *val = hp_wmi_get_fan_speed(1);
+        } else if (channel == 2) {
+            *val = hp_wmi_get_avg_rpm();
+        }
+        return *val >= 0 ? 0 : -EIO;
+    }
+
+    if (type == hwmon_pwm && channel == 0) {
+        if (attr == hwmon_pwm_enable) {
+            if (hp_wmi_fan_speed_max_get() == 1)
+                *val = 0; // Max mode
+            else if (unified_manual_mode)
+                *val = 1; // Manual
+            else
+                *val = 2; // Auto
+            return 0;
+        }
+
+        if (attr == hwmon_pwm_input) {
+            if (unified_manual_mode && unified_fan_speed >= 0) {
+                *val = (unified_fan_speed * 255) / 100;
+            } else {
+                int cur = hp_wmi_get_avg_rpm();
+                int max = hp_wmi_get_max_rpm();
+                *val = max > 0 ? (cur * 255) / max : 255;
+                *val = clamp_val(*val, 0L, 255L);
+            }
+            return 0;
+        }
+    }
+
+    return -EOPNOTSUPP;
+}
+
+static int hp_wmi_hwmon_write(struct device *dev,
+                              enum hwmon_sensor_types type,
+                              u32 attr, int channel, long val)
+{
+    if (type != hwmon_pwm || channel != 0 || attr != hwmon_pwm_input)
+        return -EOPNOTSUPP;
+
+    if (val == 0) {
+        // Auto mode
+        unified_manual_mode = false;
+        unified_fan_speed = -1;
+        user_manual_fan = 0;
+        hp_wmi_enable_auto_fan_mode();
+        return 0;
+    }
+
+    // Manual mode: val = 1-255 → percentage
+    if (val < 1) val = 1;
+    if (val > 255) val = 255;
+
+    int percent = (val * 100 + 127) / 255; // Round properly
+    int max_rpm = hp_wmi_get_max_rpm();
+    int target_rpm_div100 = (percent * (max_rpm / 100)) / 100;
+
+    u8 fan_data[4] = { target_rpm_div100, target_rpm_div100, 0, 0 };
+
+    if (hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
+                             fan_data, sizeof(fan_data), 0) == 0) {
+        unified_manual_mode = true;
+        unified_fan_speed = percent;
+        last_manual_speed = percent;
+        user_manual_fan = 1;
+        return 0;
+    }
+
+    return -EIO;
+}
+
+static const struct hwmon_channel_info *hp_wmi_hwmon_info[] = {
+    HWMON_CHANNEL_INFO(fan,
+                       HWMON_F_INPUT,    // fan1 (CPU)
+                       HWMON_F_INPUT,    // fan2 (GPU)
+                       HWMON_F_INPUT),   // fan3 (average)
+    HWMON_CHANNEL_INFO(pwm,
+                       HWMON_PWM_ENABLE | HWMON_PWM_INPUT), // unified pwm1
+    NULL
+};
+
+static const struct hwmon_ops hp_wmi_hwmon_ops = {
+    .is_visible = hp_wmi_hwmon_is_visible,
+    .read = hp_wmi_hwmon_read,
+    .write = hp_wmi_hwmon_write,
+};
+
+static const struct hwmon_chip_info hp_wmi_hwmon_chip_info = {
+    .ops = &hp_wmi_hwmon_ops,
+    .info = hp_wmi_hwmon_info,
+};
+
+static int hp_wmi_hwmon_init(void)
+{
+    struct device *dev = &hp_wmi_platform_dev->dev;
+    struct device *hwmon;
+
+    hwmon = devm_hwmon_device_register_with_info(dev, "hp_omen",
+                                                 NULL, &hp_wmi_hwmon_chip_info, NULL);
+    if (IS_ERR(hwmon)) {
+        pr_err("Failed to register hwmon device\n");
+        return PTR_ERR(hwmon);
+    }
+
+    pr_info("HP Omen unified fan control registered (pwm1 = percentage duty)\n");
+    return 0;
+}
+
+// Probe: initialize fan state and sync with power profile
+static int hp_wmi_probe(struct platform_device *pdev)
+{
+    int ret;
+
+    hp_priv = kzalloc(sizeof(*hp_priv), GFP_KERNEL);
+    if (!hp_priv)
+        return -ENOMEM;
+
+    platform_set_drvdata(pdev, hp_priv);
+
+    // Cache max RPM
+    cached_max_rpm = hp_wmi_query_max_rpm();
+
+    // Register notifiers
+    hp_priv->ac_nb.notifier_call = hp_wmi_ac_notify;
+    ret = register_power_supply_notifier(&hp_priv->ac_nb);
+    if (ret)
+        pr_warn("Failed to register AC notifier\n");
+
+    hp_priv->pm_nb.notifier_call = hp_wmi_pm_notify;
+    ret = register_pm_notifier(&hp_priv->pm_nb);
+    if (ret)
+        pr_warn("Failed to register PM notifier\n");
+
+    // Initial sync: set thermal profile based on current power state
+    enum platform_profile_option profile = ac_online ? PLATFORM_PROFILE_PERFORMANCE : PLATFORM_PROFILE_BALANCED;
+    hp_wmi_set_thermal_profile(hp_priv, profile == PLATFORM_PROFILE_PERFORMANCE ?
+                               HP_THERMAL_PROFILE_PERFORMANCE : HP_THERMAL_PROFILE_DEFAULT);
+
+    // Default to auto fan
+    unified_manual_mode = false;
+    unified_fan_speed = -1;
+    hp_wmi_enable_auto_fan_mode();
+
+    return 0;
+}
+
+static int hp_wmi_remove(struct platform_device *pdev)
+{
+    struct hp_wmi_data *data = platform_get_drvdata(pdev);
+
+    if (data) {
+        unregister_pm_notifier(&data->pm_nb);
+        unregister_power_supply_notifier(&data->ac_nb);
+        kfree(data);
+    }
+
+    return 0;
+}
+
+static struct platform_driver hp_wmi_driver = {
+    .probe = hp_wmi_probe,
+    .remove = hp_wmi_remove,
+    .driver = {
+        .name = "hp-wmi",
+        .pm = &hp_wmi_pm_ops,
+    },
+};
+
+static int __init hp_wmi_init(void)
+{
+    // ... existing init code ...
+
+    // Register hwmon early
+    hp_wmi_hwmon_init();
+
+    // Register platform driver for notifiers
+    return platform_driver_register(&hp_wmi_driver);
+}
+
+static void __exit hp_wmi_exit(void)
+{
+    platform_driver_unregister(&hp_wmi_driver);
+    // ... existing cleanup ...
+}
+
+module_init(hp_wmi_init);
+module_exit(hp_wmi_exit);
+
+MODULE_DESCRIPTION("HP WMI driver with Omen unified fan control and power profile sync");
+MODULE_LICENSE("GPL");
