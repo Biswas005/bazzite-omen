@@ -33,10 +33,9 @@
 #include <linux/workqueue.h>
 #include <linux/delay.h>        // for msleep()
 #include <linux/workqueue.h>
-#include <linux/leds.h>
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
-MODULE_DESCRIPTION("HP laptop WMI Extras (Omen: Unified fan control via pwm1 % duty; syncs to power profiles)");
+MODULE_DESCRIPTION("HP laptop WMI driver");
 MODULE_LICENSE("GPL");
 
 MODULE_ALIAS("wmi:95F24279-4D7B-4334-9387-ACCDC67EF61C");
@@ -276,8 +275,6 @@ enum hp_thermal_profile {
 #define IS_HWBLOCKED(x) ((x & HPWMI_POWER_FW_OR_HW) != HPWMI_POWER_FW_OR_HW)
 #define IS_SWBLOCKED(x) !(x & HPWMI_POWER_SOFT)
 
-#define HPWMI_GPU_MUX_GET_QUERY        0x30
-#define HPWMI_GPU_MUX_SET_QUERY        0x31
 
 
 struct bios_rfkill2_device_state {
@@ -350,80 +347,19 @@ enum hp_omen_keyboard_zone {
 // Global variable to track keyboard RGB support
 static bool hp_omen_keyboard_rgb_support = false;
 
-struct hp_kbd_led {
-    struct led_classdev cdev;
-    enum hp_omen_keyboard_zone zone;
-    struct hp_omen_keyboard_colors current_color;
-};
-
-static struct hp_kbd_led *hp_kbd_leds[HP_OMEN_KEYBOARD_ZONES];
-
-
-
 /* Forward declarations */
 static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
                                 void *buffer, int insize, int outsize);
 
 /* Forward-declare the existing static fan control functions */
-static int hp_wmi_fan_speed_get(int fan);
-static int hp_wmi_get_fan_speed_victus_s(int fan);
-static int hp_wmi_fan_speed_set_query(u8 *fan_data, int size);
-static int hp_wmi_fan_speed_max_get(void);
 static int hp_wmi_fan_speed_max_set(int enabled);
-static int hp_wmi_fan_speed_reset(void);
+static int hp_wmi_fan_speed_set_unified(int percentage);
+static int hp_wmi_fan_get_average_speed(void);
 
-struct hp_wmi_data {
-    u8 thermal_profile;
-    bool manual_mode;
-    u8 max_rpm_div100;  // Cached max RPM/100
-    struct notifier_block ac_nb;
-    struct notifier_block pm_nb;
-};
-
-static struct hp_wmi_data *hp_priv;
-
-static bool ac_online = true;
-
-// AC notifier callback
-static int hp_wmi_ac_notify(struct notifier_block *nb, unsigned long event, void *p)
-{
-    struct power_supply *psy = p;
-    union power_supply_propval val = {0};
-    struct hp_wmi_data *data = container_of(nb, struct hp_wmi_data, ac_nb);
-
-    if (event != PSY_EVENT_PROP_CHANGED || !psy || strcmp(psy->desc->name, "AC"))
-        return NOTIFY_DONE;
-    if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val))
-        ac_online = !!val.intval;
-    hp_wmi_set_thermal_profile(data, ac_online ? HP_THERMAL_PROFILE_PERFORMANCE : HP_THERMAL_PROFILE_DEFAULT);
-    return NOTIFY_OK;
-}
-
-// PM notifier for wake/resume
-static int hp_wmi_pm_notify(struct notifier_block *nb, unsigned long mode, void *unused)
-{
-    if (mode != PM_POST_SUSPEND)
-        return NOTIFY_OK;
-    struct hp_wmi_data *data = container_of(nb, struct hp_wmi_data, pm_nb);
-    int profile;
-    if (!platform_profile_get(&profile))
-        profile = PLATFORM_PROFILE_BALANCED;
-    enum hp_thermal_profile thermal = (profile == PLATFORM_PROFILE_PERFORMANCE) ?
-        HP_THERMAL_PROFILE_PERFORMANCE : HP_THERMAL_PROFILE_DEFAULT;
-    hp_wmi_set_thermal_profile(data, thermal);
-    if (!data->manual_mode) {
-        u8 auto_mode = HP_FAN_SPEED_AUTOMATIC;
-        hp_wmi_perform_query(data, HPWMI_GM, HPWMI_FAN_SPEED_SET_QUERY, &auto_mode, 1, 0);
-    }
-    return NOTIFY_OK;
-}
-
-// Thermal set fn (streamlined)
-static int hp_wmi_set_thermal_profile(struct hp_wmi_data *data, enum hp_thermal_profile profile)
-{
-    u8 cmd = profile;
-    return hp_wmi_perform_query(data, HPWMI_GM, HPWMI_THERMAL_PROFILE_SET_QUERY, &cmd, 1, 0);
-}
+/* Our new helpers to detect and cache max RPM */
+static int detected_max_rpm = -1;
+static int hp_wmi_detect_max_fan_rpm(void);
+static int hp_wmi_get_max_fan_rpm(void);
 
 static int hp_omen_keyboard_set_colors(const struct hp_omen_keyboard_colors *colors);
 
@@ -438,9 +374,14 @@ static int hp_wmi_detect_max_fan_rpm(void)
     hp_wmi_fan_speed_max_set(1);
     msleep(2000);
     max_rpm = hp_wmi_fan_get_average_speed();
+    if (max_rpm < 0) max_rpm = 5800;
+    if (max_rpm > 5800) max_rpm = 5800;
 
     /* Restore previous mode */
-    hp_wmi_fan_speed_reset();
+    if (prev_mode)
+        hp_wmi_fan_speed_set_unified(prev_speed);
+    else
+        hp_wmi_fan_speed_set_unified(-1);
 
     return detected_max_rpm = max_rpm;
 }
@@ -1277,26 +1218,19 @@ static ssize_t keyboard_rgb_colors_show(struct device *dev,
     if (ret)
         return ret;
 
-    // New (correct) ordering
-return sprintf(buf,
-    "%02x%02x%02x:"  // RIGHT (zones[0])
-    "%02x%02x%02x:"  // MIDDLE (zones[1])
-    "%02x%02x%02x:"  // LEFT (zones[2])
-    "%02x%02x%02x\n",// WASD (zones[3])
-    colors.zones[HP_OMEN_ZONE_WASD].red,    // Move WASD to last
-    colors.zones[HP_OMEN_ZONE_WASD].green,
-    colors.zones[HP_OMEN_ZONE_WASD].blue,
-    colors.zones[HP_OMEN_ZONE_RIGHT].red,   // Shift RIGHT to second
-    colors.zones[HP_OMEN_ZONE_RIGHT].green,
-    colors.zones[HP_OMEN_ZONE_RIGHT].blue,
-    colors.zones[HP_OMEN_ZONE_MIDDLE].red,  // SHIFT MIDDLE to third
-    colors.zones[HP_OMEN_ZONE_MIDDLE].green,
-    colors.zones[HP_OMEN_ZONE_MIDDLE].blue,
-    colors.zones[HP_OMEN_ZONE_LEFT].red,    // SHIFT LEFT to first
-    colors.zones[HP_OMEN_ZONE_LEFT].green,
-    colors.zones[HP_OMEN_ZONE_LEFT].blue
-);
-
+    return sprintf(buf, "%02x%02x%02x:%02x%02x%02x:%02x%02x%02x:%02x%02x%02x\n",
+                   colors.zones[HP_OMEN_ZONE_RIGHT].red,
+                   colors.zones[HP_OMEN_ZONE_RIGHT].green,
+                   colors.zones[HP_OMEN_ZONE_RIGHT].blue,
+                   colors.zones[HP_OMEN_ZONE_MIDDLE].red,
+                   colors.zones[HP_OMEN_ZONE_MIDDLE].green,
+                   colors.zones[HP_OMEN_ZONE_MIDDLE].blue,
+                   colors.zones[HP_OMEN_ZONE_LEFT].red,
+                   colors.zones[HP_OMEN_ZONE_LEFT].green,
+                   colors.zones[HP_OMEN_ZONE_LEFT].blue,
+                   colors.zones[HP_OMEN_ZONE_WASD].red,
+                   colors.zones[HP_OMEN_ZONE_WASD].green,
+                   colors.zones[HP_OMEN_ZONE_WASD].blue);
 }
 
 /**
@@ -1458,100 +1392,6 @@ static ssize_t keyboard_zone_right_store(struct device *dev,
     return count;
 }
 
-
-static void hp_kbd_led_set(struct led_classdev *led_cdev, enum led_brightness brightness)
-{
-    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
-    struct hp_omen_keyboard_colors colors;
-    int ret;
-
-    if (!hp_omen_keyboard_rgb_support)
-        return;
-
-    // Get current colors for all zones
-    ret = hp_omen_keyboard_get_colors(&colors);
-    if (ret) {
-        pr_warn("Failed to get current keyboard colors for LED update: %d\n", ret);
-        return;
-    }
-
-    // Update only the specific zone with brightness as white level
-    colors.zones[led->zone].red = brightness;
-    colors.zones[led->zone].green = brightness;
-    colors.zones[led->zone].blue = brightness;
-
-    // Store current color for this LED
-    led->current_color.zones[led->zone] = colors.zones[led->zone];
-	 // Apply the change
-    ret = hp_omen_keyboard_set_colors(&colors);
-    if (ret)
-        pr_warn("Failed to set LED brightness for zone %d: %d\n", led->zone, ret);
-}
-
-static enum led_brightness hp_kbd_led_get(struct led_classdev *led_cdev)
-{
-    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
-    struct hp_omen_keyboard_colors colors;
-    int ret;
-
-    if (!hp_omen_keyboard_rgb_support)
-        return LED_OFF;
-
-    ret = hp_omen_keyboard_get_colors(&colors);
-    if (ret)
-        return LED_OFF;
-
-    // Return the red channel as brightness (assuming RGB are equal for white)
-    return colors.zones[led->zone].red;
-}
-
-static int hp_kbd_led_set_color(struct led_classdev *led_cdev, u32 color)
-{
-    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
-    struct hp_omen_keyboard_colors colors;
-    int ret;
-
-    if (!hp_omen_keyboard_rgb_support)
-        return -ENODEV;
-
-    // Get current colors
-    ret = hp_omen_keyboard_get_colors(&colors);
-    if (ret)
-        return ret;
-
-    // Extract RGB from 24-bit color value
-    colors.zones[led->zone].red = (color >> 16) & 0xFF;
-    colors.zones[led->zone].green = (color >> 8) & 0xFF;
-    colors.zones[led->zone].blue = color & 0xFF;
-
-    // Store current color
-    led->current_color.zones[led->zone] = colors.zones[led->zone];
-	ret = hp_omen_keyboard_set_colors(&colors);
-    if (ret)
-        pr_warn("Failed to set LED color for zone %d: %d\n", led->zone, ret);
-
-    return ret;
-}
-
-static u32 hp_kbd_led_get_color(struct led_classdev *led_cdev)
-{
-    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
-    struct hp_omen_keyboard_colors colors;
-    int ret;
-
-    if (!hp_omen_keyboard_rgb_support)
-        return 0;
-
-    ret = hp_omen_keyboard_get_colors(&colors);
-    if (ret)
-        return 0;
-
-    // Combine RGB into 24-bit color value
-    return (colors.zones[led->zone].red << 16) |
-           (colors.zones[led->zone].green << 8) |
-           colors.zones[led->zone].blue;
-}
-
 // Similar functions for other zones would go here...
 // (keyboard_zone_middle_*, keyboard_zone_left_*, keyboard_zone_wasd_*)
 
@@ -1604,364 +1444,6 @@ static const struct attribute_group hp_wmi_keyboard_attr_group = {
     return 0;
 }
 
-// static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
-// {
-//     int ret;
-
-//     // Check if keyboard RGB is supported
-//     ret = hp_omen_keyboard_check_support();
-//     if (ret <= 0) {
-//         pr_info("Keyboard RGB not supported or detection failed\n");
-//         hp_omen_keyboard_rgb_support = false;
-//         return 0; // Don't fail driver init if RGB not supported
-//     }
-
-//     hp_omen_keyboard_rgb_support = true;
-//     pr_info("Keyboard RGB support detected\n");
-
-//     // Create sysfs attribute group
-//     ret = sysfs_create_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
-//     if (ret) {
-//         pr_err("Failed to create keyboar...(truncated 6382 characters)...rt_switch(hp_wmi_input_dev, SW_DOCK, val);
-//	}
-
-//	/* Tablet mode */
-//	val = hp_wmi_get_tablet_mode();
-//	if (!(val < 0)) {
-//		__set_bit(SW_TABLET_MODE, hp_wmi_input_dev->swbit);
-//		input_report_switch(hp_wmi_input_dev, SW_TABLET_MODE, val);
-//	}
-
-//	err = sparse_keymap_setup(hp_wmi_input_dev, hp_wmi_keymap, NULL);
-//	if (err)
-//		goto err_free_dev;
-
-//	/* Set initial hardware state */
-//	input_sync(hp_wmi_input_dev);
-
-//	if (!hp_wmi_bios_2009_later() && hp_wmi_bios_2008_later())
-//		hp_wmi_enable_hotkeys();
-
-//	status = wmi_install_notify_handler(HPWMI_EVENT_GUID, hp_wmi_notify, NULL);
-//	if (ACPI_FAILURE(status)) {
-//		err = -EIO;
-//		goto err_free_dev;
-//	}
-
-//	err = input_register_device(hp_wmi_input_dev);
-//	if (err)
-//		goto err_uninstall_notifier;
-
-//	return 0;
-
-// err_uninstall_notifier:
-//	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
-// err_free_dev:
-//	input_free_device(hp_wmi_input_dev);
-//	return err;
-//}
-
-//static void hp_wmi_input_destroy(void)
-//{
-//	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
-//	input_unregister_device(hp_wmi_input_dev);
-//}
-
-//static int __init hp_wmi_rfkill_setup(struct platform_device *device)
-//{
-//	int err, wireless;
-
-//	wireless = hp_wmi_read_int(HPWMI_WIRELESS_QUERY);
-//	if (wireless < 0)
-//		return wireless;
-
-//	err = hp_wmi_perform_query(HPWMI_WIRELESS_QUERY, HPWMI_WRITE, &wireless,
-//				   sizeof(wireless), 0);
-//	if (err)
-//		return err;
-
-//	if (wireless & 0x1) {
-//		wifi_rfkill = rfkill_alloc("hp-wifi", &device->dev,
-//					   RFKILL_TYPE_WLAN,
-//					   &hp_wmi_rfkill_ops,
-//					   (void *) HPWMI_WIFI);
-//		if (!wifi_rfkill)
-//			return -ENOMEM;
-//		rfkill_init_sw_state(wifi_rfkill,
-//				     hp_wmi_get_sw_state(HPWMI_WIFI));
-//		rfkill_set_hw_state(wifi_rfkill,
-//				    hp_wmi_get_hw_state(HPWMI_WIFI));
-//		err = rfkill_register(wifi_rfkill);
-//		if (err)
-//			goto register_wifi_error;
-//	}
-
-//	if (wireless & 0x2) {
-//		bluetooth_rfkill = rfkill_alloc("hp-bluetooth", &device->dev,
-//						RFKILL_TYPE_BLUETOOTH,
-//						&hp_wmi_rfkill_ops,
-//						(void *) HPWMI_BLUETOOTH);
-//		if (!bluetooth_rfkill) {
-//			err = -ENOMEM;
-//			goto register_bluetooth_error;
-//		}
-//		rfkill_init_sw_state(bluetooth_rfkill,
-//				     hp_wmi_get_sw_state(HPWMI_BLUETOOTH));
-//		rfkill_set_hw_state(bluetooth_rfkill,
-//				    hp_wmi_get_hw_state(HPWMI_BLUETOOTH));
-//		err = rfkill_register(bluetooth_rfkill);
-//		if (err)
-//			goto register_bluetooth_error;
-//	}
-
-//	if (wireless & 0x4) {
-//		wwan_rfkill = rfkill_alloc("hp-wwan", &device->dev,
-//					   RFKILL_TYPE_WWAN,
-//					   &hp_wmi_rfkill_ops,
-//					   (void *) HPWMI_WWAN);
-//		if (!wwan_rfkill) {
-//			err = -ENOMEM;
-//			goto register_wwan_error;
-//		}
-//		rfkill_init_sw_state(wwan_rfkill,
-//				     hp_wmi_get_sw_state(HPWMI_WWAN));
-//		rfkill_set_hw_state(wwan_rfkill,
-//				    hp_wmi_get_hw_state(HPWMI_WWAN));
-//		err = rfkill_register(wwan_rfkill);
-//		if (err)
-//			goto register_wwan_error;
-//	}
-
-//	return 0;
-
-//register_wwan_error:
-//	rfkill_destroy(wwan_rfkill);
-//	wwan_rfkill = NULL;
-//	if (bluetooth_rfkill)
-//		rfkill_unregister(bluetooth_rfkill);
-//register_bluetooth_error:
-//	rfkill_destroy(bluetooth_rfkill);
-//	bluetooth_rfkill = NULL;
-//	if (wifi_rfkill)
-//		rfkill_unregister(wifi_rfkill);
-//register_wifi_error:
-//	rfkill_destroy(wifi_rfkill);
-//	wifi_rfkill = NULL;
-//	return err;
-//}
-
-//static int __init hp_wmi_rfkill2_setup(struct platform_device *device)
-//{
-//	struct bios_rfkill2_state state;
-//	int err, i;
-
-//	err = hp_wmi_perform_query(HPWMI_WIRELESS2_QUERY, HPWMI_READ, &state,
-//				   zero_if_sup(state), sizeof(state));
-//	if (err)
-//		return err < 0 ? err : -EINVAL;
-
-//	if (state.count > HPWMI_MAX_RFKILL2_DEVICES) {
-//		pr_warn("unable to parse 0x1b query output\n");
-//		return -EINVAL;
-//	}
-
-//	for (i = 0; i < state.count; i++) {
-//		struct rfkill *rfkill;
-//		enum rfkill_type type;
-//		char *name;
-
-//		switch (state.device[i].radio_type) {
-//		case HPWMI_WIFI:
-//			type = RFKILL_TYPE_WLAN;
-//			name = "hp-wifi";
-//			break;
-//		case HPWMI_BLUETOOTH:
-//			type = RFKILL_TYPE_BLUETOOTH;
-//			name = "hp-bluetooth";
-//			break;
-//		case HPWMI_WWAN:
-//			type = RFKILL_TYPE_WWAN;
-//			name = "hp-wwan";
-//			break;
-//		case HPWMI_GPS:
-//			type = RFKILL_TYPE_GPS;
-//			name = "hp-gps";
-//			break;
-//		default:
-//			pr_warn("unknown device type 0x%x\n",
-//				state.device[i].radio_type);
-//			continue;
-//		}
-
-//		if (!state.device[i].vendor_id) {
-//			pr_warn("zero device %d while %d reported\n",
-//				i, state.count);
-//			continue;
-//		}
-
-//		rfkill = rfkill_alloc(name, &device->dev, type,
-//				      &hp_wmi_rfkill2_ops, (void *)(long)i);
-//		if (!rfkill) {
-//			err = -ENOMEM;
-//			goto fail;
-//		}
-
-//		rfkill2[rfkill2_count].id = state.device[i].rfkill_id;
-//		rfkill2[rfkill2_count].num = i;
-//		rfkill2[rfkill2_count].rfkill = rfkill;
-
-//		rfkill_init_sw_state(rfkill,
-//				     IS_SWBLOCKED(state.device[i].power));
-//		rfkill_set_hw_state(rfkill,
-//				    IS_HWBLOCKED(state.device[i].power));
-
-//		if (!(state.device[i].power & HPWMI_POWER_BIOS))
-//			pr_info("device %s blocked by BIOS\n", name);
-
-//		err = rfkill_register(rfkill);
-//		if (err) {
-//			rfkill_destroy(rfkill);
-//			goto fail;
-//		}
-
-//		rfkill2_count++;
-//	}
-
-//	return 0;
-//fail:
-//	for (; rfkill2_count > 0; rfkill2_count--) {
-//		rfkill_unregister(rfkill2[rfkill2_count - 1].rfkill);
-//		rfkill_destroy(rfkill2[rfkill2_count - 1].rfkill);
-//	}
-//	return err;
-//}
-
-// OMEN power/fan profile table
-struct omen_power_profile {
-    u8 cpu_pl1, cpu_pl2, cpu_pl4, cpu_combined;
-    u8 gpu_ctgp, gpu_ppab, gpu_dstate, gpu_peak_temp;
-};
-
-static ssize_t color_show(struct device *dev, struct device_attribute *attr, char *buf);
-static ssize_t color_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
-static DEVICE_ATTR_RW(color);
-
-static int hp_kbd_leds_init(struct platform_device *pdev)
-{
-    static const char *zone_names[HP_OMEN_KEYBOARD_ZONES] = {
-        "keyboard_right", "keyboard_middle", "keyboard_left", "keyboard_wasd"
-    };
-    int i, err = 0;
-
-    if (!hp_omen_keyboard_rgb_support)
-        return 0;
-
-    for (i = 0; i < HP_OMEN_KEYBOARD_ZONES; i++) {
-        struct hp_kbd_led *led;
-        char *name;
-
-        led = kzalloc(sizeof(*led), GFP_KERNEL);
-        if (!led) {
-            err = -ENOMEM;
-            goto cleanup;
-        }
-
-        led->zone = i;
-        
-        // Create LED name in format "hp::keyboard_zone"
-        name = kasprintf(GFP_KERNEL, "hp::%s", zone_names[i]);
-        if (!name) {
-            kfree(led);
-            err = -ENOMEM;
-            goto cleanup;
-        }
-
-        led->cdev.name = name;
-        led->cdev.max_brightness = LED_FULL;
-        led->cdev.brightness_set = hp_kbd_led_set;
-        led->cdev.brightness_get = hp_kbd_led_get;
-        //open-rgb identification
-		        // Add RGB color support for advanced LED controllers
-        led->cdev.flags = LED_BRIGHT_HW_CHANGED | LED_RETAIN_AT_SHUTDOWN;
-        
-        // Register the LED class device
-        err = led_classdev_register(&pdev->dev, &led->cdev);
-        if (err) {
-            kfree((char*)led->cdev.name);
-            kfree(led);
-            pr_warn("Failed to register LED for zone %d: %d\n", i, err);
-            goto cleanup;
-        }
-
-        hp_kbd_leds[i] = led;
-        pr_debug("Registered LED device: %s\n", led->cdev.name);
-		sysfs_create_file(&led->cdev.dev->kobj, &dev_attr_color.attr);
-    }
-
-    pr_info("HP Omen keyboard LED devices registered for OpenRGB compatibility\n");
-    return 0;
-
-cleanup:
-    // Clean up any LEDs that were successfully registered
-    while (i-- > 0) {
-        if (hp_kbd_leds[i]) {
-            led_classdev_unregister(&hp_kbd_leds[i]->cdev);
-            kfree((char*)hp_kbd_leds[i]->cdev.name);
-            kfree(hp_kbd_leds[i]);
-            hp_kbd_leds[i] = NULL;
-        }
-    }
-    return err;
-}
-
-// Add near other device attributes
-
-static ssize_t color_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-    struct led_classdev *cdev = dev_get_drvdata(dev);
-    struct hp_kbd_led *led = container_of(cdev, struct hp_kbd_led, cdev);
-    struct hp_omen_keyboard_colors colors;
-    int ret = hp_omen_keyboard_get_colors(&colors);
-    if (ret) return ret;
-    return sprintf(buf, "%02x%02x%02x\n",
-        colors.zones[led->zone].red,
-        colors.zones[led->zone].green,
-        colors.zones[led->zone].blue);
-}
-
-static ssize_t color_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-    struct led_classdev *cdev = dev_get_drvdata(dev);
-    struct hp_kbd_led *led = container_of(cdev, struct hp_kbd_led, cdev);
-    struct hp_omen_keyboard_colors colors;
-    unsigned int r, g, b;
-    int ret = sscanf(buf, "%02x%02x%02x", &r, &g, &b);
-    if (ret != 3) return -EINVAL;
-    ret = hp_omen_keyboard_get_colors(&colors);
-    if (ret) return ret;
-    colors.zones[led->zone].red = r;
-    colors.zones[led->zone].green = g;
-    colors.zones[led->zone].blue = b;
-    ret = hp_omen_keyboard_set_colors(&colors);
-    if (ret) return ret;
-    return count;
-}
-
-static void hp_kbd_leds_remove(void)
-{
-    int i;
-
-    for (i = 0; i < HP_OMEN_KEYBOARD_ZONES; i++) {
-        if (hp_kbd_leds[i]) {
-            led_classdev_unregister(&hp_kbd_leds[i]->cdev);
-            kfree((char*)hp_kbd_leds[i]->cdev.name);
-            kfree(hp_kbd_leds[i]);
-            hp_kbd_leds[i] = NULL;
-        }
-    }
-}
-
-// Update the existing hp_omen_keyboard_rgb_setup function
 static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
 {
     int ret;
@@ -1985,29 +1467,454 @@ static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
         return ret;
     }
 
-    // Initialize LED class devices
-    ret = hp_kbd_leds_init(device);
-    if (ret) {
-        pr_warn("Failed to initialize keyboard LED devices: %d\n", ret);
-        // Don't fail here, sysfs interface still works
-    }
-
-    pr_info("Keyboard RGB and LED interfaces created\n");
+    pr_info("Keyboard RGB sysfs interface created\n");
     return 0;
 }
 
-// Update the existing hp_omen_keyboard_rgb_remove function
+/**
+ * hp_omen_keyboard_rgb_remove - Clean up keyboard RGB support
+ * Add this function call to hp_wmi_bios_remove()
+ */
 static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
 {
-
-    // Remove LED class devices
-    hp_kbd_leds_remove();
-
-    // Remove sysfs attribute group
     if (hp_omen_keyboard_rgb_support) {
         sysfs_remove_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
     }
 }
+
+
+static ssize_t fan_unified_show(struct device *dev,
+                                struct device_attribute *attr,
+                                char *buf)
+{
+    int cpu_rpm, gpu_rpm, avg_rpm;
+    
+    if (is_victus_s_thermal_profile()) {
+        cpu_rpm = hp_wmi_get_fan_speed_victus_s(0);
+        gpu_rpm = hp_wmi_get_fan_speed_victus_s(1);
+    } else {
+        cpu_rpm = hp_wmi_get_fan_speed(0);
+        gpu_rpm = hp_wmi_get_fan_speed(1);
+    }
+    
+    avg_rpm = hp_wmi_fan_get_average_speed();
+    
+    return sprintf(buf, "Mode: %s\nSpeed: %d%%\nCPU: %d RPM\nGPU: %d RPM\nAverage: %d RPM\n",
+                   unified_manual_mode ? "Manual" : "Auto",
+                   unified_manual_mode ? unified_fan_speed : -1,
+                   cpu_rpm >= 0 ? cpu_rpm : 0,
+                   gpu_rpm >= 0 ? gpu_rpm : 0, 
+                   avg_rpm >= 0 ? avg_rpm : 0);
+}
+
+static ssize_t fan_unified_store(struct device *dev,
+                                 struct device_attribute *attr,
+                                 const char *buf, size_t count)
+{
+    int percentage;
+    int ret;
+    
+    if (strncmp(buf, "auto", 4) == 0 || strncmp(buf, "automatic", 9) == 0) {
+        ret = hp_wmi_fan_speed_set_unified(-1);  // Auto
+    } else {
+        ret = kstrtoint(buf, 0, &percentage);
+        if (ret)
+            return ret;
+            
+        if (percentage < 0 || percentage > 100)
+            return -EINVAL;
+            
+        ret = hp_wmi_fan_speed_set_unified(percentage);
+    }
+    
+    return ret ? ret : count;
+}
+
+static DEVICE_ATTR_RW(fan_unified);
+
+static DEVICE_ATTR_RO(display);
+static DEVICE_ATTR_RO(hddtemp);
+static DEVICE_ATTR_RW(als);
+static DEVICE_ATTR_RO(dock);
+static DEVICE_ATTR_RO(tablet);
+static DEVICE_ATTR_RW(postcode);
+
+static struct attribute *hp_wmi_attrs[] = {
+	&dev_attr_display.attr,
+	&dev_attr_hddtemp.attr,
+	&dev_attr_als.attr,
+	&dev_attr_dock.attr,
+	&dev_attr_tablet.attr,
+	&dev_attr_postcode.attr,
+	&dev_attr_fan_unified.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(hp_wmi);
+
+static void hp_wmi_notify(union acpi_object *obj, void *context)
+{
+	u32 event_id, event_data;
+	u32 *location;
+	int key_code;
+
+	if (!obj)
+		return;
+	if (obj->type != ACPI_TYPE_BUFFER) {
+		pr_info("Unknown response received %d\n", obj->type);
+		return;
+	}
+
+	/*
+	 * Depending on ACPI version the concatenation of id and event data
+	 * inside _WED function will result in a 8 or 16 byte buffer.
+	 */
+	location = (u32 *)obj->buffer.pointer;
+	if (obj->buffer.length == 8) {
+		event_id = *location;
+		event_data = *(location + 1);
+	} else if (obj->buffer.length == 16) {
+		event_id = *location;
+		event_data = *(location + 2);
+	} else {
+		pr_info("Unknown buffer length %d\n", obj->buffer.length);
+		return;
+	}
+
+	switch (event_id) {
+	case HPWMI_DOCK_EVENT:
+		if (test_bit(SW_DOCK, hp_wmi_input_dev->swbit))
+			input_report_switch(hp_wmi_input_dev, SW_DOCK,
+					    hp_wmi_get_dock_state());
+		if (test_bit(SW_TABLET_MODE, hp_wmi_input_dev->swbit))
+			input_report_switch(hp_wmi_input_dev, SW_TABLET_MODE,
+					    hp_wmi_get_tablet_mode());
+		input_sync(hp_wmi_input_dev);
+		break;
+	case HPWMI_PARK_HDD:
+		break;
+	case HPWMI_SMART_ADAPTER:
+		break;
+	case HPWMI_BEZEL_BUTTON:
+		key_code = hp_wmi_read_int(HPWMI_HOTKEY_QUERY);
+		if (key_code < 0)
+			break;
+
+		if (!sparse_keymap_report_event(hp_wmi_input_dev,
+						key_code, 1, true))
+			pr_info("Unknown key code - 0x%x\n", key_code);
+		break;
+	case HPWMI_OMEN_KEY:
+		if (event_data) /* Only should be true for HP Omen */
+			key_code = event_data;
+		else
+			key_code = hp_wmi_read_int(HPWMI_HOTKEY_QUERY);
+
+		if (!sparse_keymap_report_event(hp_wmi_input_dev,
+						key_code, 1, true))
+			pr_info("Unknown key code - 0x%x\n", key_code);
+		break;
+	case HPWMI_WIRELESS:
+		if (rfkill2_count) {
+			hp_wmi_rfkill2_refresh();
+			break;
+		}
+
+		if (wifi_rfkill)
+			rfkill_set_states(wifi_rfkill,
+					  hp_wmi_get_sw_state(HPWMI_WIFI),
+					  hp_wmi_get_hw_state(HPWMI_WIFI));
+		if (bluetooth_rfkill)
+			rfkill_set_states(bluetooth_rfkill,
+					  hp_wmi_get_sw_state(HPWMI_BLUETOOTH),
+					  hp_wmi_get_hw_state(HPWMI_BLUETOOTH));
+		if (wwan_rfkill)
+			rfkill_set_states(wwan_rfkill,
+					  hp_wmi_get_sw_state(HPWMI_WWAN),
+					  hp_wmi_get_hw_state(HPWMI_WWAN));
+		break;
+	case HPWMI_CPU_BATTERY_THROTTLE:
+		pr_info("Unimplemented CPU throttle because of 3 Cell battery event detected\n");
+		break;
+	case HPWMI_LOCK_SWITCH:
+		break;
+	case HPWMI_LID_SWITCH:
+		break;
+	case HPWMI_SCREEN_ROTATION:
+		break;
+	case HPWMI_COOLSENSE_SYSTEM_MOBILE:
+		break;
+	case HPWMI_COOLSENSE_SYSTEM_HOT:
+		break;
+	case HPWMI_PROXIMITY_SENSOR:
+		break;
+	case HPWMI_BACKLIT_KB_BRIGHTNESS:
+		break;
+	case HPWMI_PEAKSHIFT_PERIOD:
+		break;
+	case HPWMI_BATTERY_CHARGE_PERIOD:
+		break;
+	case HPWMI_SANITIZATION_MODE:
+		break;
+	case HPWMI_CAMERA_TOGGLE:
+		if (!camera_shutter_input_dev)
+			if (camera_shutter_input_setup()) {
+				pr_err("Failed to setup camera shutter input device\n");
+				break;
+			}
+		if (event_data == 0xff)
+			input_report_switch(camera_shutter_input_dev, SW_CAMERA_LENS_COVER, 1);
+		else if (event_data == 0xfe)
+			input_report_switch(camera_shutter_input_dev, SW_CAMERA_LENS_COVER, 0);
+		else
+			pr_warn("Unknown camera shutter state - 0x%x\n", event_data);
+		input_sync(camera_shutter_input_dev);
+		break;
+	case HPWMI_SMART_EXPERIENCE_APP:
+		break;
+	default:
+		pr_info("Unknown event_id - %d - 0x%x\n", event_id, event_data);
+		break;
+	}
+}
+
+static int __init hp_wmi_input_setup(void)
+{
+	acpi_status status;
+	int err, val;
+
+	hp_wmi_input_dev = input_allocate_device();
+	if (!hp_wmi_input_dev)
+		return -ENOMEM;
+
+	hp_wmi_input_dev->name = "HP WMI hotkeys";
+	hp_wmi_input_dev->phys = "wmi/input0";
+	hp_wmi_input_dev->id.bustype = BUS_HOST;
+
+	__set_bit(EV_SW, hp_wmi_input_dev->evbit);
+
+	/* Dock */
+	val = hp_wmi_get_dock_state();
+	if (!(val < 0)) {
+		__set_bit(SW_DOCK, hp_wmi_input_dev->swbit);
+		input_report_switch(hp_wmi_input_dev, SW_DOCK, val);
+	}
+
+	/* Tablet mode */
+	val = hp_wmi_get_tablet_mode();
+	if (!(val < 0)) {
+		__set_bit(SW_TABLET_MODE, hp_wmi_input_dev->swbit);
+		input_report_switch(hp_wmi_input_dev, SW_TABLET_MODE, val);
+	}
+
+	err = sparse_keymap_setup(hp_wmi_input_dev, hp_wmi_keymap, NULL);
+	if (err)
+		goto err_free_dev;
+
+	/* Set initial hardware state */
+	input_sync(hp_wmi_input_dev);
+
+	if (!hp_wmi_bios_2009_later() && hp_wmi_bios_2008_later())
+		hp_wmi_enable_hotkeys();
+
+	status = wmi_install_notify_handler(HPWMI_EVENT_GUID, hp_wmi_notify, NULL);
+	if (ACPI_FAILURE(status)) {
+		err = -EIO;
+		goto err_free_dev;
+	}
+
+	err = input_register_device(hp_wmi_input_dev);
+	if (err)
+		goto err_uninstall_notifier;
+
+	return 0;
+
+ err_uninstall_notifier:
+	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
+ err_free_dev:
+	input_free_device(hp_wmi_input_dev);
+	return err;
+}
+
+static void hp_wmi_input_destroy(void)
+{
+	wmi_remove_notify_handler(HPWMI_EVENT_GUID);
+	input_unregister_device(hp_wmi_input_dev);
+}
+
+static int __init hp_wmi_rfkill_setup(struct platform_device *device)
+{
+	int err, wireless;
+
+	wireless = hp_wmi_read_int(HPWMI_WIRELESS_QUERY);
+	if (wireless < 0)
+		return wireless;
+
+	err = hp_wmi_perform_query(HPWMI_WIRELESS_QUERY, HPWMI_WRITE, &wireless,
+				   sizeof(wireless), 0);
+	if (err)
+		return err;
+
+	if (wireless & 0x1) {
+		wifi_rfkill = rfkill_alloc("hp-wifi", &device->dev,
+					   RFKILL_TYPE_WLAN,
+					   &hp_wmi_rfkill_ops,
+					   (void *) HPWMI_WIFI);
+		if (!wifi_rfkill)
+			return -ENOMEM;
+		rfkill_init_sw_state(wifi_rfkill,
+				     hp_wmi_get_sw_state(HPWMI_WIFI));
+		rfkill_set_hw_state(wifi_rfkill,
+				    hp_wmi_get_hw_state(HPWMI_WIFI));
+		err = rfkill_register(wifi_rfkill);
+		if (err)
+			goto register_wifi_error;
+	}
+
+	if (wireless & 0x2) {
+		bluetooth_rfkill = rfkill_alloc("hp-bluetooth", &device->dev,
+						RFKILL_TYPE_BLUETOOTH,
+						&hp_wmi_rfkill_ops,
+						(void *) HPWMI_BLUETOOTH);
+		if (!bluetooth_rfkill) {
+			err = -ENOMEM;
+			goto register_bluetooth_error;
+		}
+		rfkill_init_sw_state(bluetooth_rfkill,
+				     hp_wmi_get_sw_state(HPWMI_BLUETOOTH));
+		rfkill_set_hw_state(bluetooth_rfkill,
+				    hp_wmi_get_hw_state(HPWMI_BLUETOOTH));
+		err = rfkill_register(bluetooth_rfkill);
+		if (err)
+			goto register_bluetooth_error;
+	}
+
+	if (wireless & 0x4) {
+		wwan_rfkill = rfkill_alloc("hp-wwan", &device->dev,
+					   RFKILL_TYPE_WWAN,
+					   &hp_wmi_rfkill_ops,
+					   (void *) HPWMI_WWAN);
+		if (!wwan_rfkill) {
+			err = -ENOMEM;
+			goto register_wwan_error;
+		}
+		rfkill_init_sw_state(wwan_rfkill,
+				     hp_wmi_get_sw_state(HPWMI_WWAN));
+		rfkill_set_hw_state(wwan_rfkill,
+				    hp_wmi_get_hw_state(HPWMI_WWAN));
+		err = rfkill_register(wwan_rfkill);
+		if (err)
+			goto register_wwan_error;
+	}
+
+	return 0;
+
+register_wwan_error:
+	rfkill_destroy(wwan_rfkill);
+	wwan_rfkill = NULL;
+	if (bluetooth_rfkill)
+		rfkill_unregister(bluetooth_rfkill);
+register_bluetooth_error:
+	rfkill_destroy(bluetooth_rfkill);
+	bluetooth_rfkill = NULL;
+	if (wifi_rfkill)
+		rfkill_unregister(wifi_rfkill);
+register_wifi_error:
+	rfkill_destroy(wifi_rfkill);
+	wifi_rfkill = NULL;
+	return err;
+}
+
+static int __init hp_wmi_rfkill2_setup(struct platform_device *device)
+{
+	struct bios_rfkill2_state state;
+	int err, i;
+
+	err = hp_wmi_perform_query(HPWMI_WIRELESS2_QUERY, HPWMI_READ, &state,
+				   zero_if_sup(state), sizeof(state));
+	if (err)
+		return err < 0 ? err : -EINVAL;
+
+	if (state.count > HPWMI_MAX_RFKILL2_DEVICES) {
+		pr_warn("unable to parse 0x1b query output\n");
+		return -EINVAL;
+	}
+
+	for (i = 0; i < state.count; i++) {
+		struct rfkill *rfkill;
+		enum rfkill_type type;
+		char *name;
+
+		switch (state.device[i].radio_type) {
+		case HPWMI_WIFI:
+			type = RFKILL_TYPE_WLAN;
+			name = "hp-wifi";
+			break;
+		case HPWMI_BLUETOOTH:
+			type = RFKILL_TYPE_BLUETOOTH;
+			name = "hp-bluetooth";
+			break;
+		case HPWMI_WWAN:
+			type = RFKILL_TYPE_WWAN;
+			name = "hp-wwan";
+			break;
+		case HPWMI_GPS:
+			type = RFKILL_TYPE_GPS;
+			name = "hp-gps";
+			break;
+		default:
+			pr_warn("unknown device type 0x%x\n",
+				state.device[i].radio_type);
+			continue;
+		}
+
+		if (!state.device[i].vendor_id) {
+			pr_warn("zero device %d while %d reported\n",
+				i, state.count);
+			continue;
+		}
+
+		rfkill = rfkill_alloc(name, &device->dev, type,
+				      &hp_wmi_rfkill2_ops, (void *)(long)i);
+		if (!rfkill) {
+			err = -ENOMEM;
+			goto fail;
+		}
+
+		rfkill2[rfkill2_count].id = state.device[i].rfkill_id;
+		rfkill2[rfkill2_count].num = i;
+		rfkill2[rfkill2_count].rfkill = rfkill;
+
+		rfkill_init_sw_state(rfkill,
+				     IS_SWBLOCKED(state.device[i].power));
+		rfkill_set_hw_state(rfkill,
+				    IS_HWBLOCKED(state.device[i].power));
+
+		if (!(state.device[i].power & HPWMI_POWER_BIOS))
+			pr_info("device %s blocked by BIOS\n", name);
+
+		err = rfkill_register(rfkill);
+		if (err) {
+			rfkill_destroy(rfkill);
+			goto fail;
+		}
+
+		rfkill2_count++;
+	}
+
+	return 0;
+fail:
+	for (; rfkill2_count > 0; rfkill2_count--) {
+		rfkill_unregister(rfkill2[rfkill2_count - 1].rfkill);
+		rfkill_destroy(rfkill2[rfkill2_count - 1].rfkill);
+	}
+	return err;
+}
+
+// OMEN power/fan profile table
+struct omen_power_profile {
+    u8 cpu_pl1, cpu_pl2, cpu_pl4, cpu_combined;
+    u8 gpu_ctgp, gpu_ppab, gpu_dstate, gpu_peak_temp;
+};
 
 static const struct omen_power_profile omen_profiles[] = {
     // Cool
@@ -2753,24 +2660,23 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 
 	thermal_profile_setup(device);
 
-	  err = hp_omen_keyboard_rgb_setup(device);
+	 err = hp_omen_keyboard_rgb_setup(device);
     if (err) {
         pr_warn("Keyboard RGB setup failed: %d\n", err);
         // Don't fail driver init, just warn
     }
+
 	return 0;
 }
 
 static void __exit hp_wmi_bios_remove(struct platform_device *device)
 {
 	int i;
-
-    hp_omen_keyboard_rgb_remove(device);
-
-    for (i = 0; i < rfkill2_count; i++) {
-        rfkill_unregister(rfkill2[i].rfkill);
-        rfkill_destroy(rfkill2[i].rfkill);
-    }
+	 hp_omen_keyboard_rgb_remove(device);
+	for (i = 0; i < rfkill2_count; i++) {
+		rfkill_unregister(rfkill2[i].rfkill);
+		rfkill_destroy(rfkill2[i].rfkill);
+	}
 
 	if (wifi_rfkill) {
 		rfkill_unregister(wifi_rfkill);
@@ -3058,6 +2964,7 @@ static int hp_wmi_hwmon_write(struct device *dev,
     return -EOPNOTSUPP;
 }
 
+
 // Update hwmon channel info for unified control
 static const struct hwmon_channel_info * const info[] = {
     // fan1=CPU, fan2=GPU, fan3=unified_average
@@ -3202,254 +3109,3 @@ static int omen_set_gpu_power(const struct omen_power_profile *p)
 
 static struct delayed_work fan_mode_watcher_work;
 static int user_manual_fan = 0; // 0 = automatic, 1 = manual/max
-
-// Cached max RPM (queried once at probe)
-static int cached_max_rpm = -1;
-
-// Query max fan RPM (used for scaling pwm1 % → actual RPM)
-static int hp_wmi_query_max_rpm(void)
-{
-    u8 max_val = 0;
-    int ret;
-
-    ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_MAX_GET_QUERY, HPWMI_GM,
-                               &max_val, zero_if_sup(max_val), sizeof(max_val));
-    if (ret)
-        return 6000; // Safe fallback ~6000 RPM
-
-    return max_val * 100;
-}
-
-// Get cached or query max RPM
-static int hp_wmi_get_max_rpm(void)
-{
-    if (cached_max_rpm < 0)
-        cached_max_rpm = hp_wmi_query_max_rpm();
-    return cached_max_rpm;
-}
-
-// Unified average fan speed (RPM)
-static int hp_wmi_get_avg_rpm(void)
-{
-    int cpu = hp_wmi_get_fan_speed(0);
-    int gpu = hp_wmi_get_fan_speed(1);
-
-    if (cpu < 0) return gpu > 0 ? gpu : 0;
-    if (gpu < 0) return cpu;
-    return (cpu + gpu) / 2;
-}
-
-// HWMON: pwm1_enable (0=max, 1=manual %, 2=auto)
-static umode_t hp_wmi_hwmon_is_visible(const void *data,
-                                      enum hwmon_sensor_types type,
-                                      u32 attr, int channel)
-{
-    if (type == hwmon_pwm) {
-        if (channel != 0) return 0;
-        return 0644;
-    }
-    if (type == hwmon_fan) {
-        if (channel > 2) return 0;
-        return 0444;
-    }
-    return 0;
-}
-
-static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
-                            u32 attr, int channel, long *val)
-{
-    if (type == hwmon_fan) {
-        if (channel == 0) {
-            *val = hp_wmi_get_fan_speed(0);
-        } else if (channel == 1) {
-            *val = hp_wmi_get_fan_speed(1);
-        } else if (channel == 2) {
-            *val = hp_wmi_get_avg_rpm();
-        }
-        return *val >= 0 ? 0 : -EIO;
-    }
-
-    if (type == hwmon_pwm && channel == 0) {
-        if (attr == hwmon_pwm_enable) {
-            if (hp_wmi_fan_speed_max_get() == 1)
-                *val = 0; // Max mode
-            else if (unified_manual_mode)
-                *val = 1; // Manual
-            else
-                *val = 2; // Auto
-            return 0;
-        }
-
-        if (attr == hwmon_pwm_input) {
-            if (unified_manual_mode && unified_fan_speed >= 0) {
-                *val = (unified_fan_speed * 255) / 100;
-            } else {
-                int cur = hp_wmi_get_avg_rpm();
-                int max = hp_wmi_get_max_rpm();
-                *val = max > 0 ? (cur * 255) / max : 255;
-                *val = clamp_val(*val, 0L, 255L);
-            }
-            return 0;
-        }
-    }
-
-    return -EOPNOTSUPP;
-}
-
-static int hp_wmi_hwmon_write(struct device *dev,
-                              enum hwmon_sensor_types type,
-                              u32 attr, int channel, long val)
-{
-    if (type != hwmon_pwm || channel != 0 || attr != hwmon_pwm_input)
-        return -EOPNOTSUPP;
-
-    if (val == 0) {
-        // Auto mode
-        unified_manual_mode = false;
-        unified_fan_speed = -1;
-        user_manual_fan = 0;
-        hp_wmi_enable_auto_fan_mode();
-        return 0;
-    }
-
-    // Manual mode: val = 1-255 → percentage
-    if (val < 1) val = 1;
-    if (val > 255) val = 255;
-
-    int percent = (val * 100 + 127) / 255; // Round properly
-    int max_rpm = hp_wmi_get_max_rpm();
-    int target_rpm_div100 = (percent * (max_rpm / 100)) / 100;
-
-    u8 fan_data[4] = { target_rpm_div100, target_rpm_div100, 0, 0 };
-
-    if (hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
-                             fan_data, sizeof(fan_data), 0) == 0) {
-        unified_manual_mode = true;
-        unified_fan_speed = percent;
-        last_manual_speed = percent;
-        user_manual_fan = 1;
-        return 0;
-    }
-
-    return -EIO;
-}
-
-static const struct hwmon_channel_info *hp_wmi_hwmon_info[] = {
-    HWMON_CHANNEL_INFO(fan,
-                       HWMON_F_INPUT,    // fan1 (CPU)
-                       HWMON_F_INPUT,    // fan2 (GPU)
-                       HWMON_F_INPUT),   // fan3 (average)
-    HWMON_CHANNEL_INFO(pwm,
-                       HWMON_PWM_ENABLE | HWMON_PWM_INPUT), // unified pwm1
-    NULL
-};
-
-static const struct hwmon_ops hp_wmi_hwmon_ops = {
-    .is_visible = hp_wmi_hwmon_is_visible,
-    .read = hp_wmi_hwmon_read,
-    .write = hp_wmi_hwmon_write,
-};
-
-static const struct hwmon_chip_info hp_wmi_hwmon_chip_info = {
-    .ops = &hp_wmi_hwmon_ops,
-    .info = hp_wmi_hwmon_info,
-};
-
-static int hp_wmi_hwmon_init(void)
-{
-    struct device *dev = &hp_wmi_platform_dev->dev;
-    struct device *hwmon;
-
-    hwmon = devm_hwmon_device_register_with_info(dev, "hp_omen",
-                                                 NULL, &hp_wmi_hwmon_chip_info, NULL);
-    if (IS_ERR(hwmon)) {
-        pr_err("Failed to register hwmon device\n");
-        return PTR_ERR(hwmon);
-    }
-
-    pr_info("HP Omen unified fan control registered (pwm1 = percentage duty)\n");
-    return 0;
-}
-
-// Probe: initialize fan state and sync with power profile
-static int hp_wmi_probe(struct platform_device *pdev)
-{
-    int ret;
-
-    hp_priv = kzalloc(sizeof(*hp_priv), GFP_KERNEL);
-    if (!hp_priv)
-        return -ENOMEM;
-
-    platform_set_drvdata(pdev, hp_priv);
-
-    // Cache max RPM
-    cached_max_rpm = hp_wmi_query_max_rpm();
-
-    // Register notifiers
-    hp_priv->ac_nb.notifier_call = hp_wmi_ac_notify;
-    ret = register_power_supply_notifier(&hp_priv->ac_nb);
-    if (ret)
-        pr_warn("Failed to register AC notifier\n");
-
-    hp_priv->pm_nb.notifier_call = hp_wmi_pm_notify;
-    ret = register_pm_notifier(&hp_priv->pm_nb);
-    if (ret)
-        pr_warn("Failed to register PM notifier\n");
-
-    // Initial sync: set thermal profile based on current power state
-    enum platform_profile_option profile = ac_online ? PLATFORM_PROFILE_PERFORMANCE : PLATFORM_PROFILE_BALANCED;
-    hp_wmi_set_thermal_profile(hp_priv, profile == PLATFORM_PROFILE_PERFORMANCE ?
-                               HP_THERMAL_PROFILE_PERFORMANCE : HP_THERMAL_PROFILE_DEFAULT);
-
-    // Default to auto fan
-    unified_manual_mode = false;
-    unified_fan_speed = -1;
-    hp_wmi_enable_auto_fan_mode();
-
-    return 0;
-}
-
-static int hp_wmi_remove(struct platform_device *pdev)
-{
-    struct hp_wmi_data *data = platform_get_drvdata(pdev);
-
-    if (data) {
-        unregister_pm_notifier(&data->pm_nb);
-        unregister_power_supply_notifier(&data->ac_nb);
-        kfree(data);
-    }
-
-    return 0;
-}
-
-static struct platform_driver hp_wmi_driver = {
-    .probe = hp_wmi_probe,
-    .remove = hp_wmi_remove,
-    .driver = {
-        .name = "hp-wmi",
-        .pm = &hp_wmi_pm_ops,
-    },
-};
-
-static int __init hp_wmi_init(void)
-{
-    // ... existing init code ...
-
-    // Register hwmon early
-    hp_wmi_hwmon_init();
-
-    // Register platform driver for notifiers
-    return platform_driver_register(&hp_wmi_driver);
-}
-
-static void __exit hp_wmi_exit(void)
-{
-    platform_driver_unregister(&hp_wmi_driver);
-    // ... existing cleanup ...
-}
-
-module_init(hp_wmi_init);
-module_exit(hp_wmi_exit);
-
-MODULE_DESCRIPTION("HP WMI driver with Omen unified fan control and power profile sync");
-MODULE_LICENSE("GPL");
