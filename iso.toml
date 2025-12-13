@@ -1,11 +1,6 @@
-distro = "fedora-43"
+distro = "fedora-43"  # Change to "fedora-41" or match your base if 43 errors out
 
-[customizations.installer.kickstart]
-contents = """
-%post
-bootc switch --mutate-in-place --transport registry ghcr.io/biswas005/bazzite-omen:latest
-%end
-"""
+# Removed kickstart - redundant for bootc-image-builder ISOs
 
 [customizations.installer.modules]
 enable = [
@@ -15,8 +10,10 @@ enable = [
   "org.fedoraproject.Anaconda.Modules.Services",
   "org.fedoraproject.Anaconda.Modules.Users",
   "org.fedoraproject.Anaconda.Modules.Subscription",
-  "org.fedoraproject.Anaconda.Modules.Timezone" 
+  "org.fedoraproject.Anaconda.Modules.Timezone"
 ]
-disable = [
-  
-]
+disable = []  # Empty; use defaults unless specific needs
+
+# Added for explicit filesystem (matches your yml; avoids defaults)
+[custom.filesystem]
+root = { type = "btrfs" }
