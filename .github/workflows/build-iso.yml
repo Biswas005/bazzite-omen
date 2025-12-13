@@ -41,7 +41,7 @@ concurrency:
 jobs:
   build-iso:
     name: Build Bazzite-Omen ISO (${{ inputs.platform || 'amd64' }})
-    runs-on: ubuntu-24.04  # Use standard; handle ARM via QEMU
+    runs-on: ubuntu-24.04
 
     strategy:
       fail-fast: false
@@ -73,16 +73,27 @@ jobs:
       - name: Setup Just
         uses: extractions/setup-just@v3
 
+      - name: Map platform to arch
+        run: |
+          if [ "${{ matrix.platform }}" == "amd64" ]; then
+            echo "ARCH=x86_64" >> $GITHUB_ENV
+          elif [ "${{ matrix.platform }}" == "arm64" ]; then
+            echo "ARCH=aarch64" >> $GITHUB_ENV
+          else
+            echo "Unsupported platform: ${{ matrix.platform }}" >&2
+            exit 1
+          fi
+
       - name: Build Bazzite-Omen ISO
         id: build
         uses: osbuild/bootc-image-builder-action@main
         with:
-          bootc-image-builder-image: quay.io/centos-bootc/bootc-image-builder:latest
-          use-librepo: true
+          builder-image: quay.io/centos-bootc/bootc-image-builder:latest
           rootfs: btrfs
           config-file: ./iso.toml
           image: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
-          architecture: ${{ matrix.platform }}
+          types: iso  # Builds ISO; add comma-separated for more (e.g., iso,qcow2)
+          additional-args: --target-arch ${{ env.ARCH }}
 
       - name: Move and rename ISO files
         if: steps.build.outcome == 'success'
@@ -96,7 +107,7 @@ jobs:
             sha256sum "${ISO_NAME}.iso" > "${ISO_NAME}.iso.sha256"
             echo "iso_filename=${ISO_NAME}.iso" >> $GITHUB_OUTPUT
           else
-            echo "No ISO found; build may have partial failure." >&2
+            echo "No ISO found in ${OUTPUT_DIR}/bootiso/install.iso; check build logs." >&2
             exit 1
           fi
         id: rename

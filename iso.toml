@@ -1,6 +1,4 @@
-distro = "fedora-43"  # Change to "fedora-41" or match your base if 43 errors out
-
-# Removed kickstart - redundant for bootc-image-builder ISOs
+distro = "fedora-43"  # Try "fedora-42" if Anaconda pull fails later
 
 [customizations.installer.modules]
 enable = [
@@ -12,8 +10,13 @@ enable = [
   "org.fedoraproject.Anaconda.Modules.Subscription",
   "org.fedoraproject.Anaconda.Modules.Timezone"
 ]
-disable = []  # Empty; use defaults unless specific needs
+disable = []
 
-# Added for explicit filesystem (matches your yml; avoids defaults)
-[custom.filesystem]
-root = { type = "btrfs" }
+# Optional: If needing custom sizes/extra mounts (uncomment/add as needed)
+# [[customizations.filesystem]]
+# mountpoint = "/"
+# min-size = "10GiB"  # Units: KiB/MiB/GiB or bytes
+
+# [[customizations.filesystem]]
+# mountpoint = "/var"
+# min-size = "5GiB"
