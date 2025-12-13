@@ -33,6 +33,7 @@ env:
   IMAGE_NAME: "bazzite-omen"
   IMAGE_REGISTRY: "ghcr.io/${{ github.repository_owner }}"
   DEFAULT_TAG: "latest"
+  BUILDER_IMAGE: "quay.io/centos-bootc/bootc-image-builder:latest"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}-${{ inputs.platform }}
@@ -84,16 +85,36 @@ jobs:
             exit 1
           fi
 
-      - name: Build Bazzite-Omen ISO
+      - name: Prepare output and keys directory
+        run: |
+          sudo rm -rf /var/lib/containers/storage
+          sudo mkdir -p /var/lib/containers/storage /etc/containers ./output ./keys
+          echo '[storage]
+          driver = "overlay"
+          runroot = "/run/containers/storage"
+          graphroot = "/var/lib/containers/storage"' | sudo tee /etc/containers/storage.conf
+
+      - name: Download Terra Mesa GPG Key
+        run: |
+          curl -o ./keys/RPM-GPG-KEY-terra43-mesa https://repos.fyralabs.com/terra43-mesa/key.asc || { echo "Key download failed; check URL or use fedora-42" >&2; exit 1; }
+
+      - name: Pull required images
+        run: |
+          sudo podman pull ${{ env.BUILDER_IMAGE }}
+          sudo podman pull ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
+
+      - name: Build Bazzite-Omen ISO (manual)
         id: build
-        uses: osbuild/bootc-image-builder-action@main
-        with:
-          builder-image: quay.io/centos-bootc/bootc-image-builder:latest
-          rootfs: btrfs
-          config-file: ./iso.toml
-          image: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
-          types: iso  # Builds ISO; add comma-separated for more (e.g., iso,qcow2)
-          additional-args: --target-arch ${{ env.ARCH }}
+        run: |
+          sudo podman run --rm --privileged --security-opt label=type:unconfined_t \
+            --volume /var/lib/containers/storage:/var/lib/containers/storage \
+            --volume ./output:/output \
+            --volume ./iso.toml:/config.toml:ro \
+            --volume ./keys:/etc/pki/rpm-gpg:ro \
+            ${{ env.BUILDER_IMAGE }} build \
+            --output /output --rootfs btrfs --target-arch ${{ env.ARCH }} --type iso \
+            ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
+          echo "output-directory=$(pwd)/output" >> $GITHUB_OUTPUT
 
       - name: Move and rename ISO files
         if: steps.build.outcome == 'success'
