@@ -1,4 +1,4 @@
-distro = "fedora-42"  # Try "fedora-42" if Anaconda pull fails later
+distro = "fedora-42"
 
 [customizations.installer.modules]
 enable = [
@@ -11,12 +11,3 @@ enable = [
   "org.fedoraproject.Anaconda.Modules.Timezone"
 ]
 disable = []
-
-# Optional: If needing custom sizes/extra mounts (uncomment/add as needed)
-# [[customizations.filesystem]]
-# mountpoint = "/"
-# min-size = "10GiB"  # Units: KiB/MiB/GiB or bytes
-
-# [[customizations.filesystem]]
-# mountpoint = "/var"
-# min-size = "5GiB"

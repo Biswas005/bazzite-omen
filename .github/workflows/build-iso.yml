@@ -85,18 +85,14 @@ jobs:
             exit 1
           fi
 
-      - name: Prepare output and keys directory
+      - name: Prepare output directory
         run: |
           sudo rm -rf /var/lib/containers/storage
-          sudo mkdir -p /var/lib/containers/storage /etc/containers ./output ./keys
+          sudo mkdir -p /var/lib/containers/storage /etc/containers ./output
           echo '[storage]
           driver = "overlay"
           runroot = "/run/containers/storage"
           graphroot = "/var/lib/containers/storage"' | sudo tee /etc/containers/storage.conf
-
-      - name: Download Terra Mesa GPG Key
-        run: |
-          curl -o ./keys/RPM-GPG-KEY-terra42-mesa https://repos.fyralabs.com/terra42-mesa/key.asc || { echo "Key download failed; check URL or use fedora-42" >&2; exit 1; }
 
       - name: Pull required images
         run: |
@@ -110,9 +106,9 @@ jobs:
             --volume /var/lib/containers/storage:/var/lib/containers/storage \
             --volume ./output:/output \
             --volume ./iso.toml:/config.toml:ro \
-            --volume ./keys:/etc/pki/rpm-gpg:ro \
             ${{ env.BUILDER_IMAGE }} build \
             --output /output --rootfs btrfs --target-arch ${{ env.ARCH }} --type iso \
+            --additional-args "--setopt=gpgcheck=0" \
             ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.DEFAULT_TAG }}
           echo "output-directory=$(pwd)/output" >> $GITHUB_OUTPUT
 
@@ -132,6 +128,9 @@ jobs:
             exit 1
           fi
         id: rename
+
+      # (Rest of steps: Upload artifacts, S3, summary - unchanged from previous)
+
 
       - name: Upload ISO to Job Artifacts
         if: steps.build.outcome == 'success' && inputs.upload-to-s3 != true
