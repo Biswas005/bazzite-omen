@@ -31,6 +31,8 @@
 #include <linux/string.h>
 #include <linux/dmi.h>
 #include <linux/workqueue.h>
+#include <linux/delay.h>        // for msleep()
+#include <linux/workqueue.h>
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
 MODULE_DESCRIPTION("HP laptop WMI driver");
@@ -97,6 +99,11 @@ static const char * const victus_thermal_profile_boards[] = {
 static const char * const victus_s_thermal_profile_boards[] = {
 	"8C9C"
 };
+
+static int unified_fan_speed = -1;
+static bool unified_manual_mode = false; 
+static int last_manual_speed = 50;
+
 
 enum hp_wmi_radio {
 	HPWMI_WIFI	= 0x0,
@@ -268,6 +275,8 @@ enum hp_thermal_profile {
 #define IS_HWBLOCKED(x) ((x & HPWMI_POWER_FW_OR_HW) != HPWMI_POWER_FW_OR_HW)
 #define IS_SWBLOCKED(x) !(x & HPWMI_POWER_SOFT)
 
+
+
 struct bios_rfkill2_device_state {
 	u8 radio_type;
 	u8 bus_type;
@@ -342,8 +351,47 @@ static bool hp_omen_keyboard_rgb_support = false;
 static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
                                 void *buffer, int insize, int outsize);
 
+/* Forward-declare the existing static fan control functions */
+static int hp_wmi_fan_speed_max_set(int enabled);
+static int hp_wmi_fan_speed_set_unified(int percentage);
+static int hp_wmi_fan_get_average_speed(void);
+
+/* Our new helpers to detect and cache max RPM */
+static int detected_max_rpm = -1;
+static int hp_wmi_detect_max_fan_rpm(void);
+static int hp_wmi_get_max_fan_rpm(void);
+
 static int hp_omen_keyboard_set_colors(const struct hp_omen_keyboard_colors *colors);
 
+/* Probe-time detection, caches max RPM */
+static int hp_wmi_detect_max_fan_rpm(void)
+{
+    int prev_mode = unified_manual_mode;
+    int prev_speed = unified_fan_speed;
+    int max_rpm;
+
+    /* Force max mode, wait, read average, clamp */
+    hp_wmi_fan_speed_max_set(1);
+    msleep(2000);
+    max_rpm = hp_wmi_fan_get_average_speed();
+    if (max_rpm < 0) max_rpm = 5800;
+    if (max_rpm > 5800) max_rpm = 5800;
+
+    /* Restore previous mode */
+    if (prev_mode)
+        hp_wmi_fan_speed_set_unified(prev_speed);
+    else
+        hp_wmi_fan_speed_set_unified(-1);
+
+    return detected_max_rpm = max_rpm;
+}
+
+static int hp_wmi_get_max_fan_rpm(void)
+{
+    if (detected_max_rpm < 0)
+        return hp_wmi_detect_max_fan_rpm();
+    return detected_max_rpm;
+}
 
 
 static int hp_omen_keyboard_check_support(void)
@@ -403,10 +451,7 @@ static struct notifier_block platform_power_source_nb;
 static enum platform_profile_option active_platform_profile;
 static bool platform_profile_support;
 static bool zero_insize_support;
-// ...existing includes...
-static void start_fan_mode_watcher(void);
-static void stop_fan_mode_watcher(void);
-// ...rest of your code...
+
 
 static struct rfkill *wifi_rfkill;
 static struct rfkill *bluetooth_rfkill;
@@ -470,6 +515,9 @@ static inline int encode_outsize_for_pvsz(int outsize)
  *       buffer = kzalloc(128, GFP_KERNEL);
  *       ret = hp_wmi_perform_query(HPWMI_BATTERY_QUERY, HPWMI_READ, buffer, 1, 128)
  */
+
+ static bool is_victus_s_thermal_profile(void);
+static void stop_fan_mode_watcher(void);
 
  /* Forward declarations */
 static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
@@ -749,6 +797,32 @@ static int hp_wmi_fan_speed_max_reset(void)
 	return ret;
 }
 
+// Enhanced automatic mode with proper EC reset
+static int hp_wmi_fan_enhanced_auto_mode(enum platform_profile_option profile)
+{
+    int ret;
+
+    // Step 1: Trigger user-defined mode (like OmenMon does)
+    ret = hp_wmi_get_fan_count_userdefine_trigger();
+    if (ret < 0) {
+        pr_warn("Failed to trigger user-defined mode: %d\n", ret);
+        // Continue anyway - fallback to standard reset
+    }
+
+    // Step 2: Use official kernel reset mechanism
+    ret = hp_wmi_fan_speed_max_reset();
+    if (ret) {
+        pr_warn("Failed to reset fan speed max: %d\n", ret);
+        return ret;
+    }
+
+    // Step 3: Set thermal profile (this applies appropriate fan curve/behavior)
+    // This will be handled by existing thermal profile functions
+    pr_info("Enhanced automatic mode activated for profile %d\n", profile);
+    
+    return 0;
+}
+
 static int hp_wmi_fan_speed_max_get(void)
 {
 	int val = 0, ret;
@@ -761,6 +835,108 @@ static int hp_wmi_fan_speed_max_get(void)
 
 	return val;
 }
+
+/**
+ * hp_wmi_fan_speed_set_unified - Set both CPU and GPU fans to same percentage
+ * @percentage: Speed percentage (0-100), -1 for automatic
+ * Returns: 0 on success, negative on error
+ * 
+ * This follows OmenMon's approach of controlling both fans together
+ */
+static int hp_wmi_fan_speed_set_unified(int percentage)
+{
+    u8 fan_data[4];
+    int ret;
+
+    if (percentage < -1 || percentage > 100)
+        return -EINVAL;
+
+    if (percentage == -1) {
+        fan_data[0] = HP_FAN_SPEED_AUTOMATIC;
+        fan_data[1] = HP_FAN_SPEED_AUTOMATIC;
+        unified_fan_speed = -1;
+        unified_manual_mode = false;
+        pr_debug("Set both fans to automatic\n");
+    } else {
+        u8 speed_value = (u8)percentage;
+        if (speed_value == 0)
+            speed_value = 1; // Avoid complete stop
+
+        fan_data[0] = speed_value;
+        fan_data[1] = speed_value;
+        unified_fan_speed = percentage;
+        unified_manual_mode = true;
+        last_manual_speed = percentage;
+        pr_debug("Set both fans to manual %d%%\n", percentage);
+    }
+
+    fan_data[2] = 0x00;
+    fan_data[3] = 0x00;
+
+    ret = hp_wmi_perform_query(HPWMI_FAN_SPEED_SET_QUERY, HPWMI_GM,
+            fan_data, sizeof(fan_data), 0);
+    if (ret != 0) {
+        pr_warn("Failed to set unified fan speed: %d\n", ret);
+        return ret;
+    }
+
+    return 0;
+}
+
+/**
+ * hp_wmi_fan_speed_get_unified - Get current unified fan mode and speed
+ * Returns: Current percentage (0-100) if manual, -1 if automatic, negative on error
+ */
+static int hp_wmi_fan_speed_get_unified(void)
+{
+    return unified_fan_speed;
+}
+
+/**
+ * hp_wmi_fan_speed_is_manual - Check if fans are in manual mode
+ * Returns: true if manual, false if automatic
+ */
+static bool hp_wmi_fan_speed_is_manual(void)
+{
+    return unified_manual_mode;
+}
+
+/**
+ * hp_wmi_fan_get_average_speed - Get average RPM of both fans
+ * Returns: Average fan speed in RPM, negative on error
+ */
+static int hp_wmi_fan_get_average_speed(void)
+{
+    int cpu_speed, gpu_speed;
+    
+    if (is_victus_s_thermal_profile()) {
+        cpu_speed = hp_wmi_get_fan_speed_victus_s(0);
+        gpu_speed = hp_wmi_get_fan_speed_victus_s(1); 
+    } else {
+        cpu_speed = hp_wmi_get_fan_speed(0);
+        gpu_speed = hp_wmi_get_fan_speed(1);
+    }
+    
+    if (cpu_speed < 0 && gpu_speed < 0)
+        return -EINVAL;
+    
+    // If one fan fails, return the other
+    if (cpu_speed < 0) return gpu_speed;
+    if (gpu_speed < 0) return cpu_speed;
+    
+    // Return average of both
+    return (cpu_speed + gpu_speed) / 2;
+}
+
+/**
+ * hp_wmi_fan_get_max_unified - Get maximum RPM for percentage calculations
+ * Returns: Max average RPM, negative on error
+ */
+static int hp_wmi_fan_get_max_unified(void)
+{
+    return hp_wmi_get_max_fan_rpm();
+}
+
 
 static int __init hp_wmi_bios_2008_later(void)
 {
@@ -1332,6 +1508,56 @@ static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
     }
 }
 
+
+static ssize_t fan_unified_show(struct device *dev,
+                                struct device_attribute *attr,
+                                char *buf)
+{
+    int cpu_rpm, gpu_rpm, avg_rpm;
+    
+    if (is_victus_s_thermal_profile()) {
+        cpu_rpm = hp_wmi_get_fan_speed_victus_s(0);
+        gpu_rpm = hp_wmi_get_fan_speed_victus_s(1);
+    } else {
+        cpu_rpm = hp_wmi_get_fan_speed(0);
+        gpu_rpm = hp_wmi_get_fan_speed(1);
+    }
+    
+    avg_rpm = hp_wmi_fan_get_average_speed();
+    
+    return sprintf(buf, "Mode: %s\nSpeed: %d%%\nCPU: %d RPM\nGPU: %d RPM\nAverage: %d RPM\n",
+                   unified_manual_mode ? "Manual" : "Auto",
+                   unified_manual_mode ? unified_fan_speed : -1,
+                   cpu_rpm >= 0 ? cpu_rpm : 0,
+                   gpu_rpm >= 0 ? gpu_rpm : 0, 
+                   avg_rpm >= 0 ? avg_rpm : 0);
+}
+
+static ssize_t fan_unified_store(struct device *dev,
+                                 struct device_attribute *attr,
+                                 const char *buf, size_t count)
+{
+    int percentage;
+    int ret;
+    
+    if (strncmp(buf, "auto", 4) == 0 || strncmp(buf, "automatic", 9) == 0) {
+        ret = hp_wmi_fan_speed_set_unified(-1);  // Auto
+    } else {
+        ret = kstrtoint(buf, 0, &percentage);
+        if (ret)
+            return ret;
+            
+        if (percentage < 0 || percentage > 100)
+            return -EINVAL;
+            
+        ret = hp_wmi_fan_speed_set_unified(percentage);
+    }
+    
+    return ret ? ret : count;
+}
+
+static DEVICE_ATTR_RW(fan_unified);
+
 static DEVICE_ATTR_RO(display);
 static DEVICE_ATTR_RO(hddtemp);
 static DEVICE_ATTR_RW(als);
@@ -1346,6 +1572,7 @@ static struct attribute *hp_wmi_attrs[] = {
 	&dev_attr_dock.attr,
 	&dev_attr_tablet.attr,
 	&dev_attr_postcode.attr,
+	&dev_attr_fan_unified.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(hp_wmi);
@@ -1842,22 +2069,33 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 		return -EINVAL;
     }
 
-    if (has_omen_thermal_profile_ec_timer()) {
-        err = omen_thermal_profile_ec_timer_set(0);
-        if (err < 0)
-            return err;
+	if (has_omen_thermal_profile_ec_timer()) {
+		err = omen_thermal_profile_ec_timer_set(0);
+		if (err < 0)
+			return err;
 
-        if (profile == PLATFORM_PROFILE_PERFORMANCE)
-            flags = HP_OMEN_EC_FLAGS_NOTIMER |
-                HP_OMEN_EC_FLAGS_TURBO;
+		if (profile == PLATFORM_PROFILE_PERFORMANCE)
+			flags = HP_OMEN_EC_FLAGS_NOTIMER |
+				HP_OMEN_EC_FLAGS_TURBO;
 
-        err = omen_thermal_profile_ec_flags_set(flags);
-        if (err < 0)
-            return err;
-    }
+		err = omen_thermal_profile_ec_flags_set(flags);
+		if (err < 0)
+			return err;
+	}
 
-    return 0;
+	// If fan is in automatic mode, reset EC and apply new profile
+	if (!unified_manual_mode) {
+		err = hp_wmi_fan_enhanced_auto_mode(profile);
+		if (err < 0) {
+			pr_warn("Failed to apply enhanced automatic mode: %d\n", err);
+			// Continue with standard behavior
+		}
+	}
+
+	return 0;
 }
+
+
 
 static int platform_profile_omen_set(struct device *dev,
 				     enum platform_profile_option profile)
@@ -2549,95 +2787,175 @@ static struct platform_driver hp_wmi_driver __refdata = {
 };
 
 static umode_t hp_wmi_hwmon_is_visible(const void *data,
-				       enum hwmon_sensor_types type,
-				       u32 attr, int channel)
+                                      enum hwmon_sensor_types type,
+                                      u32 attr, int channel)
 {
-	switch (type) {
-	case hwmon_pwm:
-		return 0644;
-	case hwmon_fan:
-		if (is_victus_s_thermal_profile()) {
-			if (hp_wmi_get_fan_speed_victus_s(channel) >= 0)
-				return 0444;
-		} else {
-			if (hp_wmi_get_fan_speed(channel) >= 0)
-				return 0444;
-		}
-		break;
-	default:
-		return 0;
-	}
+    switch (type) {
+    case hwmon_pwm:
+        // Only expose channel 0 (unified control)
+        if (channel > 0) return 0;
+        
+        if (attr == hwmon_pwm_enable)
+            return 0644;  // Fan mode control: 0=max, 1=manual, 2=auto
+        if (attr == hwmon_pwm_input)
+            return 0644;  // Unified PWM control: 0-255
+        break;
+        
+    case hwmon_fan:
+        // Expose both individual fan readings + unified average
+        if (channel > 2) return 0;  // fan1=CPU, fan2=GPU, fan3=average
+        
+        if (channel < 2) {
+            // Individual fan readings
+            if (is_victus_s_thermal_profile()) {
+                if (hp_wmi_get_fan_speed_victus_s(channel) >= 0)
+                    return 0444;
+            } else {
+                if (hp_wmi_get_fan_speed(channel) >= 0)
+                    return 0444;
+            }
+        } else {
+            // Channel 2 = unified average
+            return 0444;
+        }
+        break;
+        
+    default:
+        return 0;
+    }
 
-	return 0;
+    return 0;
 }
 
 static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
-			     u32 attr, int channel, long *val)
+                            u32 attr, int channel, long *val)
 {
-	int ret;
+    int ret;
 
-	switch (type) {
-	case hwmon_fan:
-		if (is_victus_s_thermal_profile())
-			ret = hp_wmi_get_fan_speed_victus_s(channel);
-		else
-			ret = hp_wmi_get_fan_speed(channel);
-		if (ret < 0)
-			return ret;
-		*val = ret;
-		return 0;
-	case hwmon_pwm:
-		switch (hp_wmi_fan_speed_max_get()) {
-		case 0:
-			/* 0 is automatic fan, which is 2 for hwmon */
-			*val = 2;
-			return 0;
-		case 1:
-			/* 1 is max fan, which is 0
-			 * (no fan speed control) for hwmon
-			 */
-			*val = 0;
-			return 0;
-		default:
-			/* shouldn't happen */
-			return -ENODATA;
-		}
-	default:
-		return -EINVAL;
-	}
+    switch (type) {
+    case hwmon_fan:
+        if (channel < 2) {
+            // Individual fan readings (fan1=CPU, fan2=GPU)
+            if (is_victus_s_thermal_profile())
+                ret = hp_wmi_get_fan_speed_victus_s(channel);
+            else
+                ret = hp_wmi_get_fan_speed(channel);
+        } else if (channel == 2) {
+            // Unified average reading (fan3)
+            ret = hp_wmi_fan_get_average_speed();
+        } else {
+            return -EINVAL;
+        }
+        
+        if (ret < 0)
+            return ret;
+        *val = ret;
+        return 0;
+        
+    case hwmon_pwm:
+        if (channel > 0) return -EINVAL;  // Only unified control
+        
+        if (attr == hwmon_pwm_enable) {
+            // Return current fan mode
+            if (unified_manual_mode) {
+                *val = 1;  // Manual mode
+            } else {
+                // Check if in max or auto mode
+                switch (hp_wmi_fan_speed_max_get()) {
+                case 0:
+                    *val = 2;  // Automatic
+                    return 0;
+                case 1:
+                    *val = 0;  // Max speed
+                    return 0;
+                default:
+                    return -ENODATA;
+                }
+            }
+            return 0;
+            
+        } else if (attr == hwmon_pwm_input) {
+            // Return unified PWM value (0-255)
+            if (unified_manual_mode && unified_fan_speed >= 0) {
+                // In manual mode, return set percentage converted to 0-255
+                *val = (unified_fan_speed * 255) / 100;
+            } else {
+                // Not in manual mode, calculate from current average speed
+                int current_rpm = hp_wmi_fan_get_average_speed();
+                int max_rpm;
+                
+                if (current_rpm < 0)
+                    return current_rpm;
+                
+                max_rpm = hp_wmi_fan_get_max_unified();
+                if (max_rpm <= 0) {
+                    *val = 255;  // Default to full if can't determine max
+                } else {
+                    *val = (current_rpm * 255) / max_rpm;
+                    if (*val > 255) *val = 255;
+                }
+            }
+            return 0;
+        }
+        break;
+        
+    default:
+        return -EINVAL;
+    }
+    
+    return -EINVAL;
 }
 
-static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
-			      u32 attr, int channel, long val)
+static int hp_wmi_hwmon_write(struct device *dev,
+                              enum hwmon_sensor_types type,
+                              u32 attr, int channel, long val)
 {
-	switch (type) {
-	case hwmon_pwm:
-		switch (val) {
-		case 0:
-			if (is_victus_s_thermal_profile())
-				hp_wmi_get_fan_count_userdefine_trigger();
-			/* 0 is no fan speed control (max), which is 1 for us */
-			return hp_wmi_fan_speed_max_set(1);
-		case 2:
-			/* 2 is automatic speed control, which is 0 for us */
-			if (is_victus_s_thermal_profile()) {
-				hp_wmi_get_fan_count_userdefine_trigger();
-				return hp_wmi_fan_speed_max_reset();
-			} else
-				return hp_wmi_fan_speed_max_set(0);
-		default:
-			/* we don't support manual fan speed control */
-			return -EINVAL;
-		}
-	default:
-		return -EOPNOTSUPP;
-	}
+    if (type == hwmon_pwm && channel == 0) {
+        if (attr == hwmon_pwm_input) {
+            /* Raw PWM duty: 0–255 */
+            if (val < 0 || val > 255)
+                return -EINVAL;
+
+            /* Fan off when pwm1 = 0 - Enhanced automatic with thermal profile awareness */
+            if (val == 0) {
+                unified_manual_mode = false;
+                unified_fan_speed = -1;
+                
+                // Use the official kernel reset mechanism + thermal profile awareness
+                return hp_wmi_fan_enhanced_auto_mode(active_platform_profile);
+            }
+
+            /* Manual control - existing logic unchanged */
+            const int min_pwm = (36 * 255) / 100;
+            if (val < min_pwm)
+                val = min_pwm;
+
+            /* Clear any max-mode first */
+            hp_wmi_fan_speed_max_set(0);
+
+            unified_manual_mode = true;
+            unified_fan_speed = ((val - min_pwm) * 100) / (255 - min_pwm);
+            last_manual_speed = unified_fan_speed;
+
+            return hp_wmi_fan_speed_set_unified(unified_fan_speed);
+        }
+    }
+    
+    return -EOPNOTSUPP;
 }
 
+
+// Update hwmon channel info for unified control
 static const struct hwmon_channel_info * const info[] = {
-	HWMON_CHANNEL_INFO(fan, HWMON_F_INPUT, HWMON_F_INPUT),
-	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_ENABLE),
-	NULL
+    // fan1=CPU, fan2=GPU, fan3=unified_average
+    HWMON_CHANNEL_INFO(fan, 
+                      HWMON_F_INPUT,      // CPU fan RPM
+                      HWMON_F_INPUT,      // GPU fan RPM  
+                      HWMON_F_INPUT),     // Unified average RPM
+    // Single unified PWM control                  
+    HWMON_CHANNEL_INFO(pwm,
+                      HWMON_PWM_ENABLE | HWMON_PWM_INPUT),  // Unified control
+    NULL
 };
 
 static const struct hwmon_ops ops = {
@@ -2672,6 +2990,8 @@ static int __init hp_wmi_init(void)
 	int event_capable = wmi_has_guid(HPWMI_EVENT_GUID);
 	int bios_capable = wmi_has_guid(HPWMI_BIOS_GUID);
 	int err, tmp = 0;
+	detected_max_rpm = -1;
+    hp_wmi_detect_max_fan_rpm();
 
 	if (!bios_capable && !event_capable)
 		return -ENODEV;
@@ -2725,7 +3045,7 @@ static void __exit hp_wmi_exit(void)
 {
 	if (is_omen_thermal_profile() || is_victus_thermal_profile())
 		omen_unregister_powersource_event_handler();
-		 stop_fan_mode_watcher();
+		 
 
 	if (is_victus_s_thermal_profile())
 		victus_s_unregister_powersource_event_handler();
@@ -2769,34 +3089,3 @@ static int omen_set_gpu_power(const struct omen_power_profile *p)
 
 static struct delayed_work fan_mode_watcher_work;
 static int user_manual_fan = 0; // 0 = automatic, 1 = manual/max
-
-static void fan_mode_watcher(struct work_struct *work)
-{
-    int fan_mode;
-
-    // Check if user has set manual/max fan mode
-    if (user_manual_fan) {
-        goto reschedule;
-    }
-
-    // Check current fan mode (0 = auto, 1 = max)
-    fan_mode = hp_wmi_fan_speed_max_get();
-    if (fan_mode != 0) {
-        // Not automatic, reapply EC fan profile for current platform profile
-        platform_profile_omen_set_ec(active_platform_profile);
-    }
-
-reschedule:
-    schedule_delayed_work(&fan_mode_watcher_work, msecs_to_jiffies(2000));
-}
-
-static void start_fan_mode_watcher(void)
-{
-    INIT_DELAYED_WORK(&fan_mode_watcher_work, fan_mode_watcher);
-    schedule_delayed_work(&fan_mode_watcher_work, msecs_to_jiffies(2000));
-}
-
-static void stop_fan_mode_watcher(void)
-{
-    cancel_delayed_work_sync(&fan_mode_watcher_work);
-}
