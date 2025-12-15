@@ -73,7 +73,9 @@ podman pull ghcr.io/biswas005/bazzite-omen:latest
 podman run -it ghcr.io/biswas005/bazzite-omen:latest
 ```
 ## Post Installation
-- rpm-ostree rebase ostree-image-signed:docker://ghcr.io/biswas005/bazzite-omen:latest
+```bash
+ rpm-ostree rebase ostree-image-signed:docker://ghcr.io/biswas005/bazzite-omen:latest
+```
 ## 🛠️ Development & Customization
 
 ### Building from Source
