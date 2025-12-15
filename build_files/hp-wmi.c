@@ -1404,13 +1404,38 @@ static int omen_fan_mode_set_ec(enum omen_fan_mode mode)
 	return err;
 }
 
+/* Enable manual fan control mode in EC so fan level writes take effect
+ * OMCC = 0x62, value 0x06 = Manual mode ON */
+static int omen_enable_manual_fan_control(void)
+{
+	int err = ec_write(HP_OMEN_EC_MANUAL_FAN_CONTROL_OFFSET, 0x06);
+	if (err < 0)
+		pr_warn("Failed to enable manual fan control: %d\n", err);
+	return err;
+}
+
+/* Disable manual fan control in EC and clear the manual-mode countdown
+ * This writes OMCC = 0x00 and clears XFCD (timer) so the EC will use
+ * the OEM automatic fan curves tied to the HPCM value. */
+static int omen_disable_manual_fan_control(void)
+{
+	int err;
+
+	err = ec_write(HP_OMEN_EC_MANUAL_FAN_CONTROL_OFFSET, 0x00);
+	if (err < 0)
+		pr_warn("Failed to disable manual fan control: %d\n", err);
+
+	err = omen_thermal_profile_ec_timer_set(0);
+	if (err < 0)
+		pr_warn("Failed to clear EC thermal profile timer: %d\n", err);
+
+	/* Do not propagate EC fan-control errors as fatal; best-effort only */
+	return 0;
+}
+
 static int omen_fan_mode_set(enum omen_fan_mode mode)
 {
 	u8 fan_mode_data[4] = { 0xFF, (u8)mode, 0x00, 0x00 };
-	return hp_wmi_perform_query(HPWMI_SET_PERFORMANCE_MODE, HPWMI_GM,
-				   fan_mode_data, sizeof(fan_mode_data), 0);
-}
-
 static int omen_set_cpu_power(const struct omen_power_profile *p);
 static int omen_set_gpu_power(const struct omen_power_profile *p);
 
@@ -1466,16 +1491,18 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 			break;
 		}
 
-		/* Set the thermal profile directly in EC (HPCM = 0x95) as well as via WMI */
-		omen_fan_mode_set_ec(fan_mode);
-		
-		/* Apply the fan mode via WMI BIOS command 0x1A (SetFanMode) */
-		err = omen_fan_mode_set(fan_mode);
+		/* Minimal/automatic sequence: write HPCM (profile id) then ensure
+		 * manual flags/countdown are cleared so the EC applies OEM curves.
+		 * This is lowest-friction: it relies on platform-provided curves. */
+		err = omen_fan_mode_set_ec(fan_mode);
 		if (err < 0) {
-			pr_warn("Failed to set fan mode for profile %d: %d\n", profile, err);
-			/* Don't fail if fan mode setting fails, as the power settings were successful */
-			err = 0;
+			pr_warn("Failed to set EC HPCM (fan/profile) for profile %d: %d\n", profile, err);
+			/* Continue even if HPCM write fails */
 		}
+
+		/* Clear manual mode (OMCC = 0x00) and countdown (XFCD = 0x63 = 0)
+		 * so EC's automatic profile handling takes over. */
+		omen_disable_manual_fan_control();
 	} else {
 		pr_err("No power profile found for the selected thermal profile\n");
 		return -EINVAL;
