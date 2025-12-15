@@ -43,6 +43,7 @@ MODULE_ALIAS("wmi:5FB7F034-2C63-45E9-BE91-3D44E2C707E4");
 #define HPWMI_BIOS_GUID "5FB7F034-2C63-45E9-BE91-3D44E2C707E4"
 
 #define HP_OMEN_EC_THERMAL_PROFILE_FLAGS_OFFSET 0x62
+#define HP_OMEN_EC_MANUAL_FAN_CONTROL_OFFSET 0x62  /* OMCC: same as FLAGS but used for manual fan mode */
 #define HP_OMEN_EC_THERMAL_PROFILE_TIMER_OFFSET 0x63
 #define HP_OMEN_EC_THERMAL_PROFILE_OFFSET 0x95
 
@@ -1394,6 +1395,37 @@ enum omen_fan_mode {
 	OMEN_FAN_MODE_PERFORMANCE  = 0x31,  /* Performance fan curve */
 };
 
+/* EC setup prerequisites: disable manual fan control before WMI SetFanMode applies
+ * OmenMon requirement: SetManual(false) clears OMCC (0x62) to allow automatic mode
+ * Also set HPCM (0x95) thermal profile register and countdown timer */
+static int omen_fan_mode_setup(enum omen_fan_mode mode)
+{
+	int err = 0;
+
+	/* Disable manual fan control flag (OMCC = 0x62) - set to 0x00 to disable manual mode */
+	err = ec_write(HP_OMEN_EC_MANUAL_FAN_CONTROL_OFFSET, 0x00);
+	if (err < 0) {
+		pr_warn("Failed to disable manual fan control: %d\n", err);
+		return err;
+	}
+
+	/* Reset countdown timer (XFCD = 0x63) to 0 to allow automatic fan management */
+	err = ec_write(HP_OMEN_EC_THERMAL_PROFILE_TIMER_OFFSET, 0x00);
+	if (err < 0) {
+		pr_warn("Failed to reset fan countdown: %d\n", err);
+		return err;
+	}
+
+	/* Set thermal profile mode directly in EC (HPCM = 0x95) via fan mode value */
+	err = ec_write(HP_OMEN_EC_THERMAL_PROFILE_OFFSET, (u8)mode);
+	if (err < 0) {
+		pr_warn("Failed to set EC thermal profile mode: %d\n", err);
+		return err;
+	}
+
+	return 0;
+}
+
 static int omen_fan_mode_set(enum omen_fan_mode mode)
 {
 	u8 fan_mode_data[4] = { 0xFF, (u8)mode, 0x00, 0x00 };
@@ -1438,24 +1470,35 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 		return err;
 
 	if (opp) {
+		enum omen_fan_mode fan_mode = OMEN_FAN_MODE_BALANCED;  /* Default */
+
 		omen_set_gpu_power(opp);
 		omen_set_cpu_power(opp);
 		
-		/* Apply the EC fan profile that matches thermal mode */
+		/* Select fan mode matching thermal profile */
 		switch (profile) {
 		case PLATFORM_PROFILE_COOL:
-			err = omen_fan_mode_set(OMEN_FAN_MODE_COOL);
+			fan_mode = OMEN_FAN_MODE_COOL;
 			break;
 		case PLATFORM_PROFILE_BALANCED:
-			err = omen_fan_mode_set(OMEN_FAN_MODE_BALANCED);
+			fan_mode = OMEN_FAN_MODE_BALANCED;
 			break;
 		case PLATFORM_PROFILE_PERFORMANCE:
-			err = omen_fan_mode_set(OMEN_FAN_MODE_PERFORMANCE);
+			fan_mode = OMEN_FAN_MODE_PERFORMANCE;
 			break;
-		default:
-			return -EOPNOTSUPP;
+		}
+
+		/* EC prerequisites: disable manual fan control and set profile directly via HPCM (0x95)
+		 * This must be done BEFORE calling SetFanMode (0x1A) via WMI BIOS for it to take effect */
+		err = omen_fan_mode_setup(fan_mode);
+		if (err < 0) {
+			pr_warn("EC fan setup failed, continuing with WMI fan mode change\n");
+			/* Continue anyway - WMI call may still work */
 		}
 		
+		/* Apply the fan mode via WMI BIOS command 0x1A (SetFanMode)
+		 * EC is already configured above, this reinforces the selection */
+		err = omen_fan_mode_set(fan_mode);
 		if (err < 0) {
 			pr_warn("Failed to set fan mode for profile %d: %d\n", profile, err);
 			/* Don't fail if fan mode setting fails, as the power settings were successful */
