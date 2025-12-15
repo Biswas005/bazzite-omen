@@ -30,6 +30,7 @@
 #include <linux/rfkill.h>
 #include <linux/string.h>
 #include <linux/dmi.h>
+#include <linux/workqueue.h>
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
 MODULE_DESCRIPTION("HP laptop WMI driver");
@@ -1300,6 +1301,21 @@ fail:
 	return err;
 }
 
+// OMEN power/fan profile table
+struct omen_power_profile {
+	u8 cpu_pl1, cpu_pl2, cpu_pl4, cpu_combined;
+	u8 gpu_ctgp, gpu_ppab, gpu_dstate, gpu_peak_temp;
+};
+
+static const struct omen_power_profile omen_profiles[] = {
+	// Cool
+	{ 28, 30, 35,  40,   0, 0, 0, 75},
+	// Balanced
+	{ 35, 40, 65, 0,   1, 0, 0, 80},
+	// Performance (max everything)
+	{ 65, 65, 100, 0,   1, 1, 1, 87},
+};
+
 static int platform_profile_omen_get_ec(enum platform_profile_option *profile)
 {
 	int tp;
@@ -1371,10 +1387,28 @@ inline int omen_thermal_profile_ec_timer_set(u8 value)
 	return ec_write(HP_OMEN_EC_THERMAL_PROFILE_TIMER_OFFSET, value);
 }
 
+/* OmenMon fan profile modes from FanMode enum matching thermal profiles */
+enum omen_fan_mode {
+	OMEN_FAN_MODE_COOL         = 0x100,  /* Cool thermal profile fan curve */
+	OMEN_FAN_MODE_BALANCED     = 0x30,  /* Default/Balanced fan curve */
+	OMEN_FAN_MODE_PERFORMANCE  = 0x31,  /* Performance fan curve */
+};
+
+static int omen_fan_mode_set(enum omen_fan_mode mode)
+{
+	u8 fan_mode_data[4] = { 0xFF, (u8)mode, 0x00, 0x00 };
+	return hp_wmi_perform_query(HPWMI_SET_PERFORMANCE_MODE, HPWMI_GM,
+				   fan_mode_data, sizeof(fan_mode_data), 0);
+}
+
+static int omen_set_cpu_power(const struct omen_power_profile *p);
+static int omen_set_gpu_power(const struct omen_power_profile *p);
+
 static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 {
 	int err, tp, tp_version;
 	enum hp_thermal_profile_omen_flags flags = 0;
+	const struct omen_power_profile *opp = NULL;
 
 	tp_version = omen_get_thermal_policy_version();
 
@@ -1383,30 +1417,54 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 
 	switch (profile) {
 	case PLATFORM_PROFILE_PERFORMANCE:
-		if (tp_version == 0)
-			tp = HP_OMEN_V0_THERMAL_PROFILE_PERFORMANCE;
-		else
-			tp = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE;
+		opp = &omen_profiles[2];
+		tp = (tp_version == 0) ? HP_OMEN_V0_THERMAL_PROFILE_PERFORMANCE : HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE;
 		break;
 	case PLATFORM_PROFILE_BALANCED:
-		if (tp_version == 0)
-			tp = HP_OMEN_V0_THERMAL_PROFILE_DEFAULT;
-		else
-			tp = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT;
+		opp = &omen_profiles[1];
+		tp = (tp_version == 0) ? HP_OMEN_V0_THERMAL_PROFILE_DEFAULT : HP_OMEN_V1_THERMAL_PROFILE_DEFAULT;
 		break;
 	case PLATFORM_PROFILE_COOL:
-		if (tp_version == 0)
-			tp = HP_OMEN_V0_THERMAL_PROFILE_COOL;
-		else
-			tp = HP_OMEN_V1_THERMAL_PROFILE_COOL;
+		opp = &omen_profiles[0];
+		tp = (tp_version == 0) ? HP_OMEN_V0_THERMAL_PROFILE_COOL : HP_OMEN_V1_THERMAL_PROFILE_COOL;
 		break;
 	default:
 		return -EOPNOTSUPP;
 	}
 
+	// Set thermal profile as before
 	err = omen_thermal_profile_set(tp);
 	if (err < 0)
 		return err;
+
+	if (opp) {
+		omen_set_gpu_power(opp);
+		omen_set_cpu_power(opp);
+		
+		/* Apply the EC fan profile that matches thermal mode */
+		switch (profile) {
+		case PLATFORM_PROFILE_COOL:
+			err = omen_fan_mode_set(OMEN_FAN_MODE_COOL);
+			break;
+		case PLATFORM_PROFILE_BALANCED:
+			err = omen_fan_mode_set(OMEN_FAN_MODE_BALANCED);
+			break;
+		case PLATFORM_PROFILE_PERFORMANCE:
+			err = omen_fan_mode_set(OMEN_FAN_MODE_PERFORMANCE);
+			break;
+		default:
+			return -EOPNOTSUPP;
+		}
+		
+		if (err < 0) {
+			pr_warn("Failed to set fan mode for profile %d: %d\n", profile, err);
+			/* Don't fail if fan mode setting fails, as the power settings were successful */
+			err = 0;
+		}
+	} else {
+		pr_err("No power profile found for the selected thermal profile\n");
+		return -EINVAL;
+	}
 
 	if (has_omen_thermal_profile_ec_timer()) {
 		err = omen_thermal_profile_ec_timer_set(0);
@@ -2301,3 +2359,27 @@ static void __exit hp_wmi_exit(void)
 	}
 }
 module_exit(hp_wmi_exit);
+
+static int omen_set_cpu_power(const struct omen_power_profile *p)
+{
+	struct victus_power_limits pl = {
+		.pl1 = p->cpu_pl1,
+		.pl2 = p->cpu_pl2,
+		.pl4 = p->cpu_pl4,
+		.cpu_gpu_concurrent_limit = p->cpu_combined,
+	};
+	return hp_wmi_perform_query(HPWMI_SET_POWER_LIMITS_QUERY, HPWMI_GM,
+				   &pl, sizeof(pl), 0);
+}
+
+static int omen_set_gpu_power(const struct omen_power_profile *p)
+{
+	struct victus_gpu_power_modes gp = {
+		.ctgp_enable = p->gpu_ctgp,
+		.ppab_enable = p->gpu_ppab,
+		.dstate = p->gpu_dstate,
+		.gpu_slowdown_temp = p->gpu_peak_temp,
+	};
+	return hp_wmi_perform_query(HPWMI_SET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
+				   &gp, sizeof(gp), 0);
+}
