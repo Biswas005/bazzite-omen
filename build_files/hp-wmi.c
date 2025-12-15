@@ -1435,7 +1435,13 @@ static int omen_disable_manual_fan_control(void)
 
 static int omen_fan_mode_set(enum omen_fan_mode mode)
 {
-	u8 fan_mode_data[4] = { 0xFF, (u8)mode, 0x00, 0x00 };
+	/* Prefer EC-based set; keep a simple wrapper for compatibility.
+	 * The fan_mode_data array mirrors the original WMI buffer layout
+	 * but we use direct EC HPCM writes where available. */
+	return omen_fan_mode_set_ec(mode);
+}
+
+/* Forward declarations for functions defined later in the file */
 static int omen_set_cpu_power(const struct omen_power_profile *p);
 static int omen_set_gpu_power(const struct omen_power_profile *p);
 
