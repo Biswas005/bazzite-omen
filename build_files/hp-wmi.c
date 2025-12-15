@@ -1395,35 +1395,13 @@ enum omen_fan_mode {
 	OMEN_FAN_MODE_PERFORMANCE  = 0x31,  /* Performance fan curve */
 };
 
-/* EC setup prerequisites: disable manual fan control before WMI SetFanMode applies
- * OmenMon requirement: SetManual(false) clears OMCC (0x62) to allow automatic mode
- * Also set HPCM (0x95) thermal profile register and countdown timer */
-static int omen_fan_mode_setup(enum omen_fan_mode mode)
+/* Set the EC thermal profile mode directly (HPCM = 0x95) */
+static int omen_fan_mode_set_ec(enum omen_fan_mode mode)
 {
-	int err = 0;
-
-	/* Disable manual fan control flag (OMCC = 0x62) - set to 0x00 to disable manual mode */
-	err = ec_write(HP_OMEN_EC_MANUAL_FAN_CONTROL_OFFSET, 0x00);
-	if (err < 0) {
-		pr_warn("Failed to disable manual fan control: %d\n", err);
-		return err;
-	}
-
-	/* Reset countdown timer (XFCD = 0x63) to 0 to allow automatic fan management */
-	err = ec_write(HP_OMEN_EC_THERMAL_PROFILE_TIMER_OFFSET, 0x00);
-	if (err < 0) {
-		pr_warn("Failed to reset fan countdown: %d\n", err);
-		return err;
-	}
-
-	/* Set thermal profile mode directly in EC (HPCM = 0x95) via fan mode value */
-	err = ec_write(HP_OMEN_EC_THERMAL_PROFILE_OFFSET, (u8)mode);
-	if (err < 0) {
+	int err = ec_write(HP_OMEN_EC_THERMAL_PROFILE_OFFSET, (u8)mode);
+	if (err < 0)
 		pr_warn("Failed to set EC thermal profile mode: %d\n", err);
-		return err;
-	}
-
-	return 0;
+	return err;
 }
 
 static int omen_fan_mode_set(enum omen_fan_mode mode)
@@ -1488,16 +1466,10 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 			break;
 		}
 
-		/* EC prerequisites: disable manual fan control and set profile directly via HPCM (0x95)
-		 * This must be done BEFORE calling SetFanMode (0x1A) via WMI BIOS for it to take effect */
-		err = omen_fan_mode_setup(fan_mode);
-		if (err < 0) {
-			pr_warn("EC fan setup failed, continuing with WMI fan mode change\n");
-			/* Continue anyway - WMI call may still work */
-		}
+		/* Set the thermal profile directly in EC (HPCM = 0x95) as well as via WMI */
+		omen_fan_mode_set_ec(fan_mode);
 		
-		/* Apply the fan mode via WMI BIOS command 0x1A (SetFanMode)
-		 * EC is already configured above, this reinforces the selection */
+		/* Apply the fan mode via WMI BIOS command 0x1A (SetFanMode) */
 		err = omen_fan_mode_set(fan_mode);
 		if (err < 0) {
 			pr_warn("Failed to set fan mode for profile %d: %d\n", profile, err);
