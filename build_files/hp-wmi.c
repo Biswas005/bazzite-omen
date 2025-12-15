@@ -33,6 +33,7 @@
 #include <linux/workqueue.h>
 #include <linux/delay.h>        // for msleep()
 #include <linux/workqueue.h>
+#include <linux/leds.h>
 
 MODULE_AUTHOR("Matthew Garrett <mjg59@srcf.ucam.org>");
 MODULE_DESCRIPTION("HP laptop WMI driver");
@@ -275,6 +276,8 @@ enum hp_thermal_profile {
 #define IS_HWBLOCKED(x) ((x & HPWMI_POWER_FW_OR_HW) != HPWMI_POWER_FW_OR_HW)
 #define IS_SWBLOCKED(x) !(x & HPWMI_POWER_SOFT)
 
+#define HPWMI_GPU_MUX_GET_QUERY        0x30
+#define HPWMI_GPU_MUX_SET_QUERY        0x31
 
 
 struct bios_rfkill2_device_state {
@@ -347,11 +350,22 @@ enum hp_omen_keyboard_zone {
 // Global variable to track keyboard RGB support
 static bool hp_omen_keyboard_rgb_support = false;
 
+struct hp_kbd_led {
+    struct led_classdev cdev;
+    enum hp_omen_keyboard_zone zone;
+    struct hp_omen_keyboard_colors current_color;
+};
+
+static struct hp_kbd_led *hp_kbd_leds[HP_OMEN_KEYBOARD_ZONES];
+
+
+
 /* Forward declarations */
 static int hp_wmi_perform_query(int query, enum hp_wmi_command command,
                                 void *buffer, int insize, int outsize);
 
 /* Forward-declare the existing static fan control functions */
+static int hp_wmi_fan_speed_reset(void);
 static int hp_wmi_fan_speed_max_set(int enabled);
 static int hp_wmi_fan_speed_set_unified(int percentage);
 static int hp_wmi_fan_get_average_speed(void);
@@ -374,14 +388,9 @@ static int hp_wmi_detect_max_fan_rpm(void)
     hp_wmi_fan_speed_max_set(1);
     msleep(2000);
     max_rpm = hp_wmi_fan_get_average_speed();
-    if (max_rpm < 0) max_rpm = 5800;
-    if (max_rpm > 5800) max_rpm = 5800;
 
     /* Restore previous mode */
-    if (prev_mode)
-        hp_wmi_fan_speed_set_unified(prev_speed);
-    else
-        hp_wmi_fan_speed_set_unified(-1);
+    hp_wmi_fan_speed_reset();
 
     return detected_max_rpm = max_rpm;
 }
@@ -795,32 +804,6 @@ static int hp_wmi_fan_speed_max_reset(void)
 	/* Disabling max fan speed on Victus s1xxx laptops needs a 2nd step: */
 	ret = hp_wmi_fan_speed_reset();
 	return ret;
-}
-
-// Enhanced automatic mode with proper EC reset
-static int hp_wmi_fan_enhanced_auto_mode(enum platform_profile_option profile)
-{
-    int ret;
-
-    // Step 1: Trigger user-defined mode (like OmenMon does)
-    ret = hp_wmi_get_fan_count_userdefine_trigger();
-    if (ret < 0) {
-        pr_warn("Failed to trigger user-defined mode: %d\n", ret);
-        // Continue anyway - fallback to standard reset
-    }
-
-    // Step 2: Use official kernel reset mechanism
-    ret = hp_wmi_fan_speed_max_reset();
-    if (ret) {
-        pr_warn("Failed to reset fan speed max: %d\n", ret);
-        return ret;
-    }
-
-    // Step 3: Set thermal profile (this applies appropriate fan curve/behavior)
-    // This will be handled by existing thermal profile functions
-    pr_info("Enhanced automatic mode activated for profile %d\n", profile);
-    
-    return 0;
 }
 
 static int hp_wmi_fan_speed_max_get(void)
@@ -1244,19 +1227,26 @@ static ssize_t keyboard_rgb_colors_show(struct device *dev,
     if (ret)
         return ret;
 
-    return sprintf(buf, "%02x%02x%02x:%02x%02x%02x:%02x%02x%02x:%02x%02x%02x\n",
-                   colors.zones[HP_OMEN_ZONE_RIGHT].red,
-                   colors.zones[HP_OMEN_ZONE_RIGHT].green,
-                   colors.zones[HP_OMEN_ZONE_RIGHT].blue,
-                   colors.zones[HP_OMEN_ZONE_MIDDLE].red,
-                   colors.zones[HP_OMEN_ZONE_MIDDLE].green,
-                   colors.zones[HP_OMEN_ZONE_MIDDLE].blue,
-                   colors.zones[HP_OMEN_ZONE_LEFT].red,
-                   colors.zones[HP_OMEN_ZONE_LEFT].green,
-                   colors.zones[HP_OMEN_ZONE_LEFT].blue,
-                   colors.zones[HP_OMEN_ZONE_WASD].red,
-                   colors.zones[HP_OMEN_ZONE_WASD].green,
-                   colors.zones[HP_OMEN_ZONE_WASD].blue);
+    // New (correct) ordering
+return sprintf(buf,
+    "%02x%02x%02x:"  // RIGHT (zones[0])
+    "%02x%02x%02x:"  // MIDDLE (zones[1])
+    "%02x%02x%02x:"  // LEFT (zones[2])
+    "%02x%02x%02x\n",// WASD (zones[3])
+    colors.zones[HP_OMEN_ZONE_WASD].red,    // Move WASD to last
+    colors.zones[HP_OMEN_ZONE_WASD].green,
+    colors.zones[HP_OMEN_ZONE_WASD].blue,
+    colors.zones[HP_OMEN_ZONE_RIGHT].red,   // Shift RIGHT to second
+    colors.zones[HP_OMEN_ZONE_RIGHT].green,
+    colors.zones[HP_OMEN_ZONE_RIGHT].blue,
+    colors.zones[HP_OMEN_ZONE_MIDDLE].red,  // SHIFT MIDDLE to third
+    colors.zones[HP_OMEN_ZONE_MIDDLE].green,
+    colors.zones[HP_OMEN_ZONE_MIDDLE].blue,
+    colors.zones[HP_OMEN_ZONE_LEFT].red,    // SHIFT LEFT to first
+    colors.zones[HP_OMEN_ZONE_LEFT].green,
+    colors.zones[HP_OMEN_ZONE_LEFT].blue
+);
+
 }
 
 /**
@@ -1418,6 +1408,100 @@ static ssize_t keyboard_zone_right_store(struct device *dev,
     return count;
 }
 
+
+static void hp_kbd_led_set(struct led_classdev *led_cdev, enum led_brightness brightness)
+{
+    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return;
+
+    // Get current colors for all zones
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret) {
+        pr_warn("Failed to get current keyboard colors for LED update: %d\n", ret);
+        return;
+    }
+
+    // Update only the specific zone with brightness as white level
+    colors.zones[led->zone].red = brightness;
+    colors.zones[led->zone].green = brightness;
+    colors.zones[led->zone].blue = brightness;
+
+    // Store current color for this LED
+    led->current_color.zones[led->zone] = colors.zones[led->zone];
+	 // Apply the change
+    ret = hp_omen_keyboard_set_colors(&colors);
+    if (ret)
+        pr_warn("Failed to set LED brightness for zone %d: %d\n", led->zone, ret);
+}
+
+static enum led_brightness hp_kbd_led_get(struct led_classdev *led_cdev)
+{
+    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return LED_OFF;
+
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret)
+        return LED_OFF;
+
+    // Return the red channel as brightness (assuming RGB are equal for white)
+    return colors.zones[led->zone].red;
+}
+
+static int hp_kbd_led_set_color(struct led_classdev *led_cdev, u32 color)
+{
+    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return -ENODEV;
+
+    // Get current colors
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret)
+        return ret;
+
+    // Extract RGB from 24-bit color value
+    colors.zones[led->zone].red = (color >> 16) & 0xFF;
+    colors.zones[led->zone].green = (color >> 8) & 0xFF;
+    colors.zones[led->zone].blue = color & 0xFF;
+
+    // Store current color
+    led->current_color.zones[led->zone] = colors.zones[led->zone];
+	ret = hp_omen_keyboard_set_colors(&colors);
+    if (ret)
+        pr_warn("Failed to set LED color for zone %d: %d\n", led->zone, ret);
+
+    return ret;
+}
+
+static u32 hp_kbd_led_get_color(struct led_classdev *led_cdev)
+{
+    struct hp_kbd_led *led = container_of(led_cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return 0;
+
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret)
+        return 0;
+
+    // Combine RGB into 24-bit color value
+    return (colors.zones[led->zone].red << 16) |
+           (colors.zones[led->zone].green << 8) |
+           colors.zones[led->zone].blue;
+}
+
 // Similar functions for other zones would go here...
 // (keyboard_zone_middle_*, keyboard_zone_left_*, keyboard_zone_wasd_*)
 
@@ -1470,43 +1554,43 @@ static const struct attribute_group hp_wmi_keyboard_attr_group = {
     return 0;
 }
 
-static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
-{
-    int ret;
+// static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
+// {
+//     int ret;
 
-    // Check if keyboard RGB is supported
-    ret = hp_omen_keyboard_check_support();
-    if (ret <= 0) {
-        pr_info("Keyboard RGB not supported or detection failed\n");
-        hp_omen_keyboard_rgb_support = false;
-        return 0; // Don't fail driver init if RGB not supported
-    }
+//     // Check if keyboard RGB is supported
+//     ret = hp_omen_keyboard_check_support();
+//     if (ret <= 0) {
+//         pr_info("Keyboard RGB not supported or detection failed\n");
+//         hp_omen_keyboard_rgb_support = false;
+//         return 0; // Don't fail driver init if RGB not supported
+//     }
 
-    hp_omen_keyboard_rgb_support = true;
-    pr_info("Keyboard RGB support detected\n");
+//     hp_omen_keyboard_rgb_support = true;
+//     pr_info("Keyboard RGB support detected\n");
 
-    // Create sysfs attribute group
-    ret = sysfs_create_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
-    if (ret) {
-        pr_err("Failed to create keyboard RGB sysfs attributes: %d\n", ret);
-        hp_omen_keyboard_rgb_support = false;
-        return ret;
-    }
+//     // Create sysfs attribute group
+//     ret = sysfs_create_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+//     if (ret) {
+//         pr_err("Failed to create keyboard RGB sysfs attributes: %d\n", ret);
+//         hp_omen_keyboard_rgb_support = false;
+//         return ret;
+//     }
 
-    pr_info("Keyboard RGB sysfs interface created\n");
-    return 0;
-}
+//     pr_info("Keyboard RGB sysfs interface created\n");
+//     return 0;
+// }
 
 /**
  * hp_omen_keyboard_rgb_remove - Clean up keyboard RGB support
  * Add this function call to hp_wmi_bios_remove()
  */
-static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
-{
-    if (hp_omen_keyboard_rgb_support) {
-        sysfs_remove_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
-    }
-}
+// static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
+// {
+//     if (hp_omen_keyboard_rgb_support) {
+//         sysfs_remove_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+//     }
+// }
 
 
 static ssize_t fan_unified_show(struct device *dev,
@@ -1942,6 +2026,173 @@ struct omen_power_profile {
     u8 gpu_ctgp, gpu_ppab, gpu_dstate, gpu_peak_temp;
 };
 
+static ssize_t color_show(struct device *dev, struct device_attribute *attr, char *buf);
+static ssize_t color_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count);
+static DEVICE_ATTR_RW(color);
+
+static int hp_kbd_leds_init(struct platform_device *pdev)
+{
+    static const char *zone_names[HP_OMEN_KEYBOARD_ZONES] = {
+        "keyboard_right", "keyboard_middle", "keyboard_left", "keyboard_wasd"
+    };
+    int i, err = 0;
+
+    if (!hp_omen_keyboard_rgb_support)
+        return 0;
+
+    for (i = 0; i < HP_OMEN_KEYBOARD_ZONES; i++) {
+        struct hp_kbd_led *led;
+        char *name;
+
+        led = kzalloc(sizeof(*led), GFP_KERNEL);
+        if (!led) {
+            err = -ENOMEM;
+            goto cleanup;
+        }
+
+        led->zone = i;
+        
+        // Create LED name in format "hp::keyboard_zone"
+        name = kasprintf(GFP_KERNEL, "hp::%s", zone_names[i]);
+        if (!name) {
+            kfree(led);
+            err = -ENOMEM;
+            goto cleanup;
+        }
+
+        led->cdev.name = name;
+        led->cdev.max_brightness = LED_FULL;
+        led->cdev.brightness_set = hp_kbd_led_set;
+        led->cdev.brightness_get = hp_kbd_led_get;
+        //open-rgb identification
+		        // Add RGB color support for advanced LED controllers
+        led->cdev.flags = LED_BRIGHT_HW_CHANGED | LED_RETAIN_AT_SHUTDOWN;
+        
+        // Register the LED class device
+        err = led_classdev_register(&pdev->dev, &led->cdev);
+        if (err) {
+            kfree((char*)led->cdev.name);
+            kfree(led);
+            pr_warn("Failed to register LED for zone %d: %d\n", i, err);
+            goto cleanup;
+        }
+
+        hp_kbd_leds[i] = led;
+        pr_debug("Registered LED device: %s\n", led->cdev.name);
+		sysfs_create_file(&led->cdev.dev->kobj, &dev_attr_color.attr);
+    }
+
+    pr_info("HP Omen keyboard LED devices registered for OpenRGB compatibility\n");
+    return 0;
+
+cleanup:
+    // Clean up any LEDs that were successfully registered
+    while (i-- > 0) {
+        if (hp_kbd_leds[i]) {
+            led_classdev_unregister(&hp_kbd_leds[i]->cdev);
+            kfree((char*)hp_kbd_leds[i]->cdev.name);
+            kfree(hp_kbd_leds[i]);
+            hp_kbd_leds[i] = NULL;
+        }
+    }
+    return err;
+}
+
+// Add near other device attributes
+
+static ssize_t color_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+    struct led_classdev *cdev = dev_get_drvdata(dev);
+    struct hp_kbd_led *led = container_of(cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    int ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret) return ret;
+    return sprintf(buf, "%02x%02x%02x\n",
+        colors.zones[led->zone].red,
+        colors.zones[led->zone].green,
+        colors.zones[led->zone].blue);
+}
+
+static ssize_t color_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+{
+    struct led_classdev *cdev = dev_get_drvdata(dev);
+    struct hp_kbd_led *led = container_of(cdev, struct hp_kbd_led, cdev);
+    struct hp_omen_keyboard_colors colors;
+    unsigned int r, g, b;
+    int ret = sscanf(buf, "%02x%02x%02x", &r, &g, &b);
+    if (ret != 3) return -EINVAL;
+    ret = hp_omen_keyboard_get_colors(&colors);
+    if (ret) return ret;
+    colors.zones[led->zone].red = r;
+    colors.zones[led->zone].green = g;
+    colors.zones[led->zone].blue = b;
+    ret = hp_omen_keyboard_set_colors(&colors);
+    if (ret) return ret;
+    return count;
+}
+
+static void hp_kbd_leds_remove(void)
+{
+    int i;
+
+    for (i = 0; i < HP_OMEN_KEYBOARD_ZONES; i++) {
+        if (hp_kbd_leds[i]) {
+            led_classdev_unregister(&hp_kbd_leds[i]->cdev);
+            kfree((char*)hp_kbd_leds[i]->cdev.name);
+            kfree(hp_kbd_leds[i]);
+            hp_kbd_leds[i] = NULL;
+        }
+    }
+}
+
+// Update the existing hp_omen_keyboard_rgb_setup function
+static int hp_omen_keyboard_rgb_setup(struct platform_device *device)
+{
+    int ret;
+
+    // Check if keyboard RGB is supported
+    ret = hp_omen_keyboard_check_support();
+    if (ret <= 0) {
+        pr_info("Keyboard RGB not supported or detection failed\n");
+        hp_omen_keyboard_rgb_support = false;
+        return 0; // Don't fail driver init if RGB not supported
+    }
+
+    hp_omen_keyboard_rgb_support = true;
+    pr_info("Keyboard RGB support detected\n");
+
+    // Create sysfs attribute group
+    ret = sysfs_create_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+    if (ret) {
+        pr_err("Failed to create keyboard RGB sysfs attributes: %d\n", ret);
+        hp_omen_keyboard_rgb_support = false;
+        return ret;
+    }
+
+    // Initialize LED class devices for OpenRGB compatibility
+    ret = hp_kbd_leds_init(device);
+    if (ret) {
+        pr_warn("Failed to initialize keyboard LED devices: %d\n", ret);
+        // Don't fail here, sysfs interface still works
+    }
+
+    pr_info("Keyboard RGB and LED interfaces created\n");
+    return 0;
+}
+
+// Update the existing hp_omen_keyboard_rgb_remove function
+static void hp_omen_keyboard_rgb_remove(struct platform_device *device)
+{
+
+    // Remove LED class devices
+    hp_kbd_leds_remove();
+
+    // Remove sysfs attribute group
+    if (hp_omen_keyboard_rgb_support) {
+        sysfs_remove_group(&device->dev.kobj, &hp_wmi_keyboard_attr_group);
+    }
+}
+
 static const struct omen_power_profile omen_profiles[] = {
     // Cool
     { 28, 30, 35,  40,   0, 0, 0, 75},
@@ -2069,33 +2320,22 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 		return -EINVAL;
     }
 
-	if (has_omen_thermal_profile_ec_timer()) {
-		err = omen_thermal_profile_ec_timer_set(0);
-		if (err < 0)
-			return err;
+    if (has_omen_thermal_profile_ec_timer()) {
+        err = omen_thermal_profile_ec_timer_set(0);
+        if (err < 0)
+            return err;
 
-		if (profile == PLATFORM_PROFILE_PERFORMANCE)
-			flags = HP_OMEN_EC_FLAGS_NOTIMER |
-				HP_OMEN_EC_FLAGS_TURBO;
+        if (profile == PLATFORM_PROFILE_PERFORMANCE)
+            flags = HP_OMEN_EC_FLAGS_NOTIMER |
+                HP_OMEN_EC_FLAGS_TURBO;
 
-		err = omen_thermal_profile_ec_flags_set(flags);
-		if (err < 0)
-			return err;
-	}
+        err = omen_thermal_profile_ec_flags_set(flags);
+        if (err < 0)
+            return err;
+    }
 
-	// If fan is in automatic mode, reset EC and apply new profile
-	if (!unified_manual_mode) {
-		err = hp_wmi_fan_enhanced_auto_mode(profile);
-		if (err < 0) {
-			pr_warn("Failed to apply enhanced automatic mode: %d\n", err);
-			// Continue with standard behavior
-		}
-	}
-
-	return 0;
+    return 0;
 }
-
-
 
 static int platform_profile_omen_set(struct device *dev,
 				     enum platform_profile_option profile)
@@ -2697,23 +2937,24 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 
 	thermal_profile_setup(device);
 
-	 err = hp_omen_keyboard_rgb_setup(device);
+	  err = hp_omen_keyboard_rgb_setup(device);
     if (err) {
         pr_warn("Keyboard RGB setup failed: %d\n", err);
         // Don't fail driver init, just warn
     }
-
 	return 0;
 }
 
 static void __exit hp_wmi_bios_remove(struct platform_device *device)
 {
 	int i;
-	 hp_omen_keyboard_rgb_remove(device);
-	for (i = 0; i < rfkill2_count; i++) {
-		rfkill_unregister(rfkill2[i].rfkill);
-		rfkill_destroy(rfkill2[i].rfkill);
-	}
+
+    hp_omen_keyboard_rgb_remove(device);
+
+    for (i = 0; i < rfkill2_count; i++) {
+        rfkill_unregister(rfkill2[i].rfkill);
+        rfkill_destroy(rfkill2[i].rfkill);
+    }
 
 	if (wifi_rfkill) {
 		rfkill_unregister(wifi_rfkill);
@@ -2777,6 +3018,75 @@ static const struct dev_pm_ops hp_wmi_pm_ops = {
  * runtime. So mark the driver struct with __refdata to prevent modpost
  * triggering a section mismatch warning.
  */
+// Use official 2-step reset sequence on enabling auto mode
+static int hp_wmi_enable_auto_fan_mode(void)
+{
+    int ret;
+
+    // Disable max mode first
+    ret = hp_wmi_fan_speed_max_set(0);
+    if (ret)
+        return ret;
+
+    // Reset to automatic speed
+    ret = hp_wmi_fan_speed_reset();
+    return ret;
+}
+
+
+// Convert user percentage 0-100 to PWM in safe model range
+static int hp_wmi_percentage_to_pwm(int percentage)
+{
+    int pwm_min = 0;  // model-specific min PWM
+    int pwm_max = 186;  // model-specific max PWM
+
+    if (percentage == 0)
+        return 0;  // auto mode disables manual PWM
+
+    if (percentage < 0)
+        percentage = 0;
+    if (percentage > 100)
+        percentage = 100;
+
+    return pwm_min + (percentage * (pwm_max - pwm_min)) / 100;
+}
+
+struct fan_curve_point {
+    u8 temp_c;
+    u8 pwm;
+};
+
+static const struct fan_curve_point omen_perf_curve[] = {
+    { 40, 120 },
+    { 50, 150 },
+    { 60, 180 },
+    { 70, 220 },
+    { 80, 255 },
+};
+
+static int apply_fan_curve(int cpu_temp)
+{
+    int i;
+    int pwm = 0;
+
+    for (i = 0; i < ARRAY_SIZE(omen_perf_curve) - 1; i++) {
+        if (cpu_temp >= omen_perf_curve[i].temp_c && cpu_temp < omen_perf_curve[i+1].temp_c) {
+            // linear interpolation for PWM
+            int range_temp = omen_perf_curve[i+1].temp_c - omen_perf_curve[i].temp_c;
+            int range_pwm = omen_perf_curve[i+1].pwm - omen_perf_curve[i].pwm;
+            int offset_temp = cpu_temp - omen_perf_curve[i].temp_c;
+            pwm = omen_perf_curve[i].pwm + (range_pwm * offset_temp) / range_temp;
+            break;
+        }
+    }
+    if (cpu_temp <= omen_perf_curve[0].temp_c)
+        pwm = omen_perf_curve[0].pwm;
+    if (cpu_temp >= omen_perf_curve[ARRAY_SIZE(omen_perf_curve) - 1].temp_c)
+        pwm = omen_perf_curve[ARRAY_SIZE(omen_perf_curve) - 1].pwm;
+
+    return pwm;
+}
+
 static struct platform_driver hp_wmi_driver __refdata = {
 	.driver = {
 		.name = "hp-wmi",
@@ -2910,40 +3220,27 @@ static int hp_wmi_hwmon_write(struct device *dev,
                               enum hwmon_sensor_types type,
                               u32 attr, int channel, long val)
 {
-    if (type == hwmon_pwm && channel == 0) {
-        if (attr == hwmon_pwm_input) {
-            /* Raw PWM duty: 0–255 */
-            if (val < 0 || val > 255)
-                return -EINVAL;
+    int pwm;
 
-            /* Fan off when pwm1 = 0 - Enhanced automatic with thermal profile awareness */
-            if (val == 0) {
-                unified_manual_mode = false;
-                unified_fan_speed = -1;
-                
-                // Use the official kernel reset mechanism + thermal profile awareness
-                return hp_wmi_fan_enhanced_auto_mode(active_platform_profile);
-            }
-
-            /* Manual control - existing logic unchanged */
-            const int min_pwm = (36 * 255) / 100;
-            if (val < min_pwm)
-                val = min_pwm;
-
-            /* Clear any max-mode first */
-            hp_wmi_fan_speed_max_set(0);
-
-            unified_manual_mode = true;
-            unified_fan_speed = ((val - min_pwm) * 100) / (255 - min_pwm);
-            last_manual_speed = unified_fan_speed;
-
-            return hp_wmi_fan_speed_set_unified(unified_fan_speed);
+    if (type == hwmon_pwm && channel == 0 && attr == hwmon_pwm_input) {
+        // Auto mode
+        if (val == 0) {
+            unified_manual_mode = false;
+            unified_fan_speed = -1;
+            hp_wmi_enable_auto_fan_mode();
+            return 0;
         }
+
+        // Manual mode, enforce min/max PWM safe ranges
+        pwm = hp_wmi_percentage_to_pwm(val);
+        unified_manual_mode = true;
+        unified_fan_speed = val;
+        last_manual_speed = val;
+
+        return hp_wmi_fan_speed_set_unified(val);
     }
-    
     return -EOPNOTSUPP;
 }
-
 
 // Update hwmon channel info for unified control
 static const struct hwmon_channel_info * const info[] = {
