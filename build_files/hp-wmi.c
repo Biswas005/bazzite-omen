@@ -1997,7 +1997,21 @@ static int platform_profile_victus_set(struct device *dev,
 
   return 0;
 }
+static bool is_omen_manual_fan_board(void)
+{
+    const char *board = dmi_get_system_info(DMI_BOARD_NAME);
+    int i;
 
+    if (!board)
+        return false;
+
+    for (i = 0; omen_manual_fan_boards[i]; i++) {
+        if (!strcmp(board, omen_manual_fan_boards[i]))
+            return true;
+    }
+
+    return false;
+}
 static int hp_wmi_platform_profile_probe(void *drvdata,
                                          unsigned long *choices) {
   if (is_omen_thermal_profile()) {
@@ -2383,7 +2397,7 @@ static int hp_wmi_apply_fan_settings(struct hp_wmi_hwmon_priv *priv) {
                           secs_to_jiffies(KEEP_ALIVE_DELAY_SECS));
     return 0;
   case PWM_MODE_MANUAL:
-    if (!is_victus_s_thermal_profile())
+    if (!is_victus_s_thermal_profile() && !is_omen_manual_fan_board())
       return -EOPNOTSUPP;
     ret = hp_wmi_fan_speed_set(priv, pwm_to_rpm(priv->pwm, priv));
     if (ret < 0)
@@ -2415,8 +2429,8 @@ static umode_t hp_wmi_hwmon_is_visible(const void *data,
                                        int channel) {
   switch (type) {
   case hwmon_pwm:
-    if (attr == hwmon_pwm_input && !is_victus_s_thermal_profile())
-      return 0;
+    if (attr == hwmon_pwm_input && !is_victus_s_thermal_profile() && !is_omen_manual_fan_board())
+    return 0;
     return 0644;
   case hwmon_fan:
     if (is_victus_s_thermal_profile()) {
@@ -2452,7 +2466,7 @@ static int hp_wmi_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
     return 0;
   case hwmon_pwm:
     if (attr == hwmon_pwm_input) {
-      if (!is_victus_s_thermal_profile())
+      if (!is_victus_s_thermal_profile() && !is_omen_manual_fan_board())
         return -EOPNOTSUPP;
 
       rpm = hp_wmi_get_fan_speed_victus_s(channel);
@@ -2485,7 +2499,7 @@ static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
   switch (type) {
   case hwmon_pwm:
     if (attr == hwmon_pwm_input) {
-      if (!is_victus_s_thermal_profile())
+      if (!is_victus_s_thermal_profile() && !is_omen_manual_fan_board())
         return -EOPNOTSUPP;
       /* PWM input is invalid when not in manual mode */
       if (priv->mode != PWM_MODE_MANUAL)
@@ -2502,7 +2516,7 @@ static int hp_wmi_hwmon_write(struct device *dev, enum hwmon_sensor_types type,
       priv->mode = PWM_MODE_MAX;
       return hp_wmi_apply_fan_settings(priv);
     case PWM_MODE_MANUAL:
-      if (!is_victus_s_thermal_profile())
+      if (!is_victus_s_thermal_profile() && !is_omen_manual_fan_board())
         return -EOPNOTSUPP;
       /*
        * When switching to manual mode, set fan speed to
@@ -2564,7 +2578,7 @@ static int hp_wmi_setup_fan_settings(struct hp_wmi_hwmon_priv *priv) {
   priv->mode = PWM_MODE_AUTO;
 
   /* Bypass all non-Victus S devices */
-  if (!is_victus_s_thermal_profile())
+  if (!is_victus_s_thermal_profile() && !is_omen_manual_fan_board())
     return 0;
 
   ret = hp_wmi_perform_query(HPWMI_VICTUS_S_GET_FAN_TABLE_QUERY, HPWMI_GM,
