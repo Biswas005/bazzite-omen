@@ -144,7 +144,7 @@ static const char * const omen_thermal_profile_boards[] = {
 	"886B", "886C", "88C8", "88CB", "88D1", "88D2", "88F4", "88F5", "88F6",
 	"88F7", "88FD", "88FE", "88FF",
 	"8900", "8901", "8902", "8912", "8917", "8918", "8949", "894A", "89EB",
-	"8A15", "8A42", "8A$$"
+	"8A15", "8A42", "8A44",
 	"8BAD",
 };
 
@@ -283,6 +283,8 @@ struct victus_gpu_power_modes {
 	u8 dstate;
 	u8 gpu_slowdown_temp;
 };
+
+
 
 enum hp_wmi_gm_commandtype {
 	HPWMI_FAN_SPEED_GET_QUERY		= 0x11,
@@ -1505,9 +1507,15 @@ inline int omen_thermal_profile_ec_timer_set(u8 value)
 	return ec_write(HP_OMEN_EC_THERMAL_PROFILE_TIMER_OFFSET, value);
 }
 
+static int omen_gpu_thermal_profile_set(bool ctgp_enable,
+					bool ppab_enable,
+					u8 dstate);
+
 static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 {
 	int err, tp, tp_version;
+	bool gpu_ctgp_enable, gpu_ppab_enable;
+	u8 gpu_dstate;
 	enum hp_thermal_profile_omen_flags flags = 0;
 
 	tp_version = omen_get_thermal_policy_version();
@@ -1521,24 +1529,45 @@ static int platform_profile_omen_set_ec(enum platform_profile_option profile)
 			tp = HP_OMEN_V0_THERMAL_PROFILE_PERFORMANCE;
 		else
 			tp = HP_OMEN_V1_THERMAL_PROFILE_PERFORMANCE;
+
+		gpu_ctgp_enable = true;
+		gpu_ppab_enable = true;
+		gpu_dstate = 1;
 		break;
+
 	case PLATFORM_PROFILE_BALANCED:
 		if (tp_version == 0)
 			tp = HP_OMEN_V0_THERMAL_PROFILE_DEFAULT;
 		else
 			tp = HP_OMEN_V1_THERMAL_PROFILE_DEFAULT;
+
+		gpu_ctgp_enable = false;
+		gpu_ppab_enable = true;
+		gpu_dstate = 1;
 		break;
+
 	case PLATFORM_PROFILE_COOL:
 		if (tp_version == 0)
 			tp = HP_OMEN_V0_THERMAL_PROFILE_COOL;
 		else
 			tp = HP_OMEN_V1_THERMAL_PROFILE_COOL;
+
+		gpu_ctgp_enable = false;
+		gpu_ppab_enable = false;
+		gpu_dstate = 1;
 		break;
+
 	default:
 		return -EOPNOTSUPP;
 	}
 
 	err = omen_thermal_profile_set(tp);
+	if (err < 0)
+		return err;
+
+	err = omen_gpu_thermal_profile_set(gpu_ctgp_enable,
+					   gpu_ppab_enable,
+					   gpu_dstate);
 	if (err < 0)
 		return err;
 
@@ -1926,6 +1955,32 @@ static int platform_profile_victus_set(struct device *dev,
 	return 0;
 }
 
+static int omen_gpu_thermal_profile_set(bool ctgp_enable, bool ppab_enable, u8 dstate)
+{
+	struct victus_gpu_power_modes gpu_power_modes;
+	int ret;
+	bool current_ctgp_state, current_ppab_state;
+	u8 current_dstate, current_gpu_slowdown_temp;
+
+	ret = victus_s_gpu_thermal_profile_get(&current_ctgp_state,
+					       &current_ppab_state,
+					       &current_dstate,
+					       &current_gpu_slowdown_temp);
+	if (ret < 0)
+		return ret;
+
+	gpu_power_modes.ctgp_enable = ctgp_enable ? 0x01 : 0x00;
+	gpu_power_modes.ppab_enable = ppab_enable ? 0x01 : 0x00;
+	gpu_power_modes.dstate = dstate;
+	gpu_power_modes.gpu_slowdown_temp = current_gpu_slowdown_temp;
+
+	return hp_wmi_perform_query(HPWMI_SET_GPU_THERMAL_MODES_QUERY,
+				    HPWMI_GM,
+				    &gpu_power_modes,
+				    sizeof(gpu_power_modes),
+				    0);
+}
+
 static int hp_wmi_platform_profile_probe(void *drvdata, unsigned long *choices)
 {
 	if (is_omen_thermal_profile()) {
@@ -2099,9 +2154,15 @@ static const struct platform_profile_ops platform_profile_victus_ops = {
 	.profile_set = platform_profile_victus_set,
 };
 
+static int platform_profile_victus_s_get(struct device *dev,
+					 enum platform_profile_option *profile)
+{
+	return platform_profile_victus_s_get_ec(profile);
+}
+
 static const struct platform_profile_ops platform_profile_victus_s_ops = {
 	.probe = hp_wmi_platform_profile_probe,
-	.profile_get = platform_profile_omen_get,
+	.profile_get = platform_profile_victus_s_get,
 	.profile_set = platform_profile_victus_s_set,
 };
 
