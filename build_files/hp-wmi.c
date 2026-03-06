@@ -144,7 +144,7 @@ static const char * const omen_thermal_profile_boards[] = {
 	"886B", "886C", "88C8", "88CB", "88D1", "88D2", "88F4", "88F5", "88F6",
 	"88F7", "88FD", "88FE", "88FF",
 	"8900", "8901", "8902", "8912", "8917", "8918", "8949", "894A", "89EB",
-	"8A15", "8A42",
+	"8A15", "8A42", "8A$$"
 	"8BAD",
 };
 
@@ -1720,81 +1720,71 @@ static bool is_victus_s_thermal_profile(void)
 }
 
 static int victus_s_gpu_thermal_profile_get(bool *ctgp_enable,
-					    bool *ppab_enable,
-					    u8 *dstate,
-					    u8 *gpu_slowdown_temp)
+                                            bool *ppab_enable,
+                                            u8 *dstate,
+                                            u8 *gpu_slowdown_temp)
 {
-	struct victus_gpu_power_modes gpu_power_modes;
-	int ret;
+    struct victus_gpu_power_modes gpu_power_modes;
+    int ret;
 
-	ret = hp_wmi_perform_query(HPWMI_GET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
-				   &gpu_power_modes, sizeof(gpu_power_modes),
-				   sizeof(gpu_power_modes));
-	if (ret == 0) {
-		*ctgp_enable = gpu_power_modes.ctgp_enable ? true : false;
-		*ppab_enable = gpu_power_modes.ppab_enable ? true : false;
-		*dstate = gpu_power_modes.dstate;
-		*gpu_slowdown_temp = gpu_power_modes.gpu_slowdown_temp;
-	}
-
-	return ret;
+    ret = hp_wmi_perform_query(HPWMI_GET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
+                               &gpu_power_modes, sizeof(gpu_power_modes),
+                               sizeof(gpu_power_modes));
+    if (ret == 0) {
+        *ctgp_enable = gpu_power_modes.ctgp_enable ? true : false;
+        *ppab_enable = gpu_power_modes.ppab_enable ? true : false;
+        *dstate = gpu_power_modes.dstate;
+        *gpu_slowdown_temp = gpu_power_modes.gpu_slowdown_temp;
+    }
+    return ret;
 }
 
 static int victus_s_gpu_thermal_profile_set(bool ctgp_enable,
-					    bool ppab_enable,
-					    u8 dstate)
+                                            bool ppab_enable,
+                                            u8 dstate)
 {
-	struct victus_gpu_power_modes gpu_power_modes;
-	int ret;
+    struct victus_gpu_power_modes gpu_power_modes;
+    int ret;
+    bool current_ctgp_state, current_ppab_state;
+    u8 current_dstate, current_gpu_slowdown_temp;
 
-	bool current_ctgp_state, current_ppab_state;
-	u8 current_dstate, current_gpu_slowdown_temp;
+    /* Keep slowdown temp unchanged */
+    ret = victus_s_gpu_thermal_profile_get(&current_ctgp_state,
+                                           &current_ppab_state,
+                                           &current_dstate,
+                                           &current_gpu_slowdown_temp);
+    if (ret < 0)
+        return ret;
 
-	/* Retrieving GPU slowdown temperature, in order to keep it unchanged */
-	ret = victus_s_gpu_thermal_profile_get(&current_ctgp_state,
-					       &current_ppab_state,
-					       &current_dstate,
-					       &current_gpu_slowdown_temp);
-	if (ret < 0) {
-		pr_warn("GPU modes not updated, unable to get slowdown temp\n");
-		return ret;
-	}
+    gpu_power_modes.ctgp_enable = ctgp_enable ? 0x01 : 0x00;
+    gpu_power_modes.ppab_enable = ppab_enable ? 0x01 : 0x00;
+    gpu_power_modes.dstate = dstate;
+    gpu_power_modes.gpu_slowdown_temp = current_gpu_slowdown_temp;
 
-	gpu_power_modes.ctgp_enable = ctgp_enable ? 0x01 : 0x00;
-	gpu_power_modes.ppab_enable = ppab_enable ? 0x01 : 0x00;
-	gpu_power_modes.dstate = dstate;
-	gpu_power_modes.gpu_slowdown_temp = current_gpu_slowdown_temp;
-
-
-	ret = hp_wmi_perform_query(HPWMI_SET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
-				   &gpu_power_modes, sizeof(gpu_power_modes), 0);
-
-	return ret;
+    ret = hp_wmi_perform_query(HPWMI_SET_GPU_THERMAL_MODES_QUERY, HPWMI_GM,
+                               &gpu_power_modes, sizeof(gpu_power_modes), 0);
+    return ret;
 }
 
-/* Note: HP_POWER_LIMIT_DEFAULT can be used to restore default PL1 and PL2 */
+/* Optional: CPU PL1/PL2 adjustment (used on battery/AC switch in some cases) */
 static int victus_s_set_cpu_pl1_pl2(u8 pl1, u8 pl2)
 {
-	struct victus_power_limits power_limits;
-	int ret;
+    struct victus_power_limits power_limits = {0};
+    int ret;
 
-	/* We need to know both PL1 and PL2 values in order to check them */
-	if (pl1 == HP_POWER_LIMIT_NO_CHANGE || pl2 == HP_POWER_LIMIT_NO_CHANGE)
-		return -EINVAL;
+    if (pl1 == HP_POWER_LIMIT_NO_CHANGE || pl2 == HP_POWER_LIMIT_NO_CHANGE)
+        return -EINVAL;
+    if (pl2 < pl1)
+        return -EINVAL;
 
-	/* PL2 is not supposed to be lower than PL1 */
-	if (pl2 < pl1)
-		return -EINVAL;
+    power_limits.pl1 = pl1;
+    power_limits.pl2 = pl2;
+    power_limits.pl4 = HP_POWER_LIMIT_NO_CHANGE;
+    power_limits.cpu_gpu_concurrent_limit = HP_POWER_LIMIT_NO_CHANGE;
 
-	power_limits.pl1 = pl1;
-	power_limits.pl2 = pl2;
-	power_limits.pl4 = HP_POWER_LIMIT_NO_CHANGE;
-	power_limits.cpu_gpu_concurrent_limit = HP_POWER_LIMIT_NO_CHANGE;
-
-	ret = hp_wmi_perform_query(HPWMI_SET_POWER_LIMITS_QUERY, HPWMI_GM,
-				   &power_limits, sizeof(power_limits), 0);
-
-	return ret;
+    ret = hp_wmi_perform_query(HPWMI_SET_POWER_LIMITS_QUERY, HPWMI_GM,
+                               &power_limits, sizeof(power_limits), 0);
+    return ret;
 }
 
 static int platform_profile_victus_s_get_ec(enum platform_profile_option *profile)
@@ -1853,55 +1843,55 @@ static int platform_profile_victus_s_get_ec(enum platform_profile_option *profil
 
 static int platform_profile_victus_s_set_ec(enum platform_profile_option profile)
 {
-	struct thermal_profile_params *params;
-	bool gpu_ctgp_enable, gpu_ppab_enable;
-	u8 gpu_dstate; /* Test shows 1 = 100%, 2 = 50%, 3 = 25%, 4 = 12.5% */
-	int err, tp;
+    struct thermal_profile_params *params;
+    bool gpu_ctgp_enable, gpu_ppab_enable;
+    u8 gpu_dstate; /* 1 = 100%, 2 = 50%, 3 = 25%, 4 = 12.5% */
+    int err, tp;
 
-	params = active_thermal_profile_params;
-	if (!params)
-		return -ENODEV;
+    params = active_thermal_profile_params;
+    if (!params)
+        return -ENODEV;
 
-	switch (profile) {
-	case PLATFORM_PROFILE_PERFORMANCE:
-		tp = params->performance;
-		gpu_ctgp_enable = true;
-		gpu_ppab_enable = true;
-		gpu_dstate = 1;
-		break;
-	case PLATFORM_PROFILE_BALANCED:
-		tp = params->balanced;
-		gpu_ctgp_enable = false;
-		gpu_ppab_enable = true;
-		gpu_dstate = 1;
-		break;
-	case PLATFORM_PROFILE_LOW_POWER:
-		tp = params->low_power;
-		gpu_ctgp_enable = false;
-		gpu_ppab_enable = false;
-		gpu_dstate = 1;
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
+    switch (profile) {
+    case PLATFORM_PROFILE_PERFORMANCE:
+        tp = params->performance;
+        gpu_ctgp_enable = true;
+        gpu_ppab_enable = true;
+        gpu_dstate = 1;
+        break;
+    case PLATFORM_PROFILE_BALANCED:
+        tp = params->balanced;
+        gpu_ctgp_enable = false;
+        gpu_ppab_enable = true;
+        gpu_dstate = 1;
+        break;
+    case PLATFORM_PROFILE_LOW_POWER:
+        tp = params->low_power;
+        gpu_ctgp_enable = false;
+        gpu_ppab_enable = false;
+        gpu_dstate = 1;
+        break;
+    default:
+        return -EOPNOTSUPP;
+    }
 
-	hp_wmi_get_fan_count_userdefine_trigger();
+    hp_wmi_get_fan_count_userdefine_trigger();  // also needed for TGP stability on some models
 
-	err = omen_thermal_profile_set(tp);
-	if (err < 0) {
-		pr_err("Failed to set platform profile %d: %d\n", profile, err);
-		return err;
-	}
+    err = omen_thermal_profile_set(tp);
+    if (err < 0) {
+        pr_err("Failed to set thermal profile %d: %d\n", profile, err);
+        return err;
+    }
 
-	err = victus_s_gpu_thermal_profile_set(gpu_ctgp_enable,
-					       gpu_ppab_enable,
-					       gpu_dstate);
-	if (err < 0) {
-		pr_err("Failed to set GPU profile %d: %d\n", profile, err);
-		return err;
-	}
+    err = victus_s_gpu_thermal_profile_set(gpu_ctgp_enable,
+                                           gpu_ppab_enable,
+                                           gpu_dstate);
+    if (err < 0) {
+        pr_err("Failed to set GPU power modes for profile %d: %d\n", profile, err);
+        return err;
+    }
 
-	return 0;
+    return 0;
 }
 
 static int platform_profile_victus_s_set(struct device *dev,
