@@ -299,6 +299,8 @@ enum hp_wmi_gm_commandtype {
 	HPWMI_VICTUS_S_FAN_SPEED_GET_QUERY	= 0x2D,
 	HPWMI_VICTUS_S_FAN_SPEED_SET_QUERY	= 0x2E,
 	HPWMI_VICTUS_S_GET_FAN_TABLE_QUERY	= 0x2F,
+	HPWMI_GET_GRAPHICS_MODE_QUERY = 0x52,
+	HPWMI_SET_GRAPHICS_MODE_QUERY = 0x53,
 };
 
 enum hp_wmi_command {
@@ -393,6 +395,16 @@ static struct notifier_block platform_power_source_nb;
 static enum platform_profile_option active_platform_profile;
 static bool platform_profile_support;
 static bool zero_insize_support;
+
+enum hp_wmi_gpu_mode {
+	HP_WMI_GPU_MODE_HYBRID = 0,
+	HP_WMI_GPU_MODE_DISCRETE = 1,
+	HP_WMI_GPU_MODE_OPTIMUS = 2,
+};
+
+static bool gpu_mode_support;
+static enum hp_wmi_gpu_mode active_gpu_mode;
+static DEFINE_MUTEX(gpu_mode_lock);
 
 static struct rfkill *wifi_rfkill;
 static struct rfkill *bluetooth_rfkill;
@@ -682,6 +694,8 @@ static int hp_wmi_get_tablet_mode(void)
 	return system_device_mode[0] == DEVICE_MODE_TABLET;
 }
 
+
+
 static int omen_thermal_profile_set(int mode)
 {
 	/* The Omen Control Center actively sets the first byte of the buffer to
@@ -760,6 +774,176 @@ static int hp_wmi_fan_speed_max_set(int enabled)
 
 	return enabled;
 }
+
+static const char *hp_wmi_gpu_mode_to_str(enum hp_wmi_gpu_mode mode)
+{
+	switch (mode) {
+	case HP_WMI_GPU_MODE_HYBRID:
+		return "hybrid";
+	case HP_WMI_GPU_MODE_DISCRETE:
+		return "discrete";
+	case HP_WMI_GPU_MODE_OPTIMUS:
+		return "optimus";
+	default:
+		return "unknown";
+	}
+}
+
+static int hp_wmi_gpu_mode_from_str(const char *buf, enum hp_wmi_gpu_mode *mode)
+{
+	if (sysfs_streq(buf, "hybrid")) {
+		*mode = HP_WMI_GPU_MODE_HYBRID;
+		return 0;
+	}
+	if (sysfs_streq(buf, "discrete")) {
+		*mode = HP_WMI_GPU_MODE_DISCRETE;
+		return 0;
+	}
+	if (sysfs_streq(buf, "optimus")) {
+		*mode = HP_WMI_GPU_MODE_OPTIMUS;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static int hp_wmi_get_gpu_mode(enum hp_wmi_gpu_mode *mode)
+{
+	u8 data[4] = {};
+	int ret;
+
+	ret = hp_wmi_perform_query(HPWMI_GET_GRAPHICS_MODE_QUERY,
+				   HPWMI_GM,
+				   data,
+				   sizeof(u8),
+				   sizeof(data));
+	if (ret)
+		return ret < 0 ? ret : -EINVAL;
+
+	switch (data[0]) {
+	case 0x00:
+		*mode = HP_WMI_GPU_MODE_HYBRID;
+		break;
+	case 0x01:
+		*mode = HP_WMI_GPU_MODE_DISCRETE;
+		break;
+	case 0x02:
+		*mode = HP_WMI_GPU_MODE_OPTIMUS;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+static int hp_wmi_set_gpu_mode(enum hp_wmi_gpu_mode mode)
+{
+	u8 data[4] = { 0 };
+	int ret;
+
+	switch (mode) {
+	case HP_WMI_GPU_MODE_HYBRID:
+		data[0] = 0x00;
+		break;
+	case HP_WMI_GPU_MODE_DISCRETE:
+		data[0] = 0x01;
+		break;
+	case HP_WMI_GPU_MODE_OPTIMUS:
+		data[0] = 0x02;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	ret = hp_wmi_perform_query(HPWMI_SET_GRAPHICS_MODE_QUERY,
+				   HPWMI_GM,
+				   data,
+				   sizeof(u8),
+				   sizeof(data));
+	if (ret)
+		return ret < 0 ? ret : -EINVAL;
+
+	active_gpu_mode = mode;
+	return 0;
+}
+
+static int hp_wmi_gpu_mode_setup(void)
+{
+	enum hp_wmi_gpu_mode mode;
+	int ret;
+
+	ret = hp_wmi_get_gpu_mode(&mode);
+	if (ret) {
+		gpu_mode_support = false;
+		return ret;
+	}
+
+	active_gpu_mode = mode;
+	gpu_mode_support = true;
+	return 0;
+}
+
+static ssize_t graphics_mode_show(struct device *dev,
+				  struct device_attribute *attr,
+				  char *buf)
+{
+	enum hp_wmi_gpu_mode mode;
+	int ret;
+
+	if (!gpu_mode_support)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&gpu_mode_lock);
+	ret = hp_wmi_get_gpu_mode(&mode);
+	if (!ret)
+		active_gpu_mode = mode;
+	else
+		mode = active_gpu_mode;
+	mutex_unlock(&gpu_mode_lock);
+
+	if (ret && ret != -EOPNOTSUPP)
+		return ret;
+
+	return sysfs_emit(buf, "%s\n", hp_wmi_gpu_mode_to_str(mode));
+}
+
+static ssize_t graphics_mode_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf,
+				   size_t count)
+{
+	enum hp_wmi_gpu_mode mode;
+	int ret;
+
+	if (!gpu_mode_support)
+		return -EOPNOTSUPP;
+
+	ret = hp_wmi_gpu_mode_from_str(buf, &mode);
+	if (ret)
+		return ret;
+
+	mutex_lock(&gpu_mode_lock);
+	ret = hp_wmi_set_gpu_mode(mode);
+	mutex_unlock(&gpu_mode_lock);
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+static ssize_t graphics_modes_show(struct device *dev,
+				   struct device_attribute *attr,
+				   char *buf)
+{
+	if (!gpu_mode_support)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "hybrid discrete optimus\n");
+}
+
+static DEVICE_ATTR_RW(graphics_mode);
+static DEVICE_ATTR_RO(graphics_modes);
 
 static int hp_wmi_fan_speed_set(struct hp_wmi_hwmon_priv *priv, u8 speed)
 {
@@ -2266,7 +2450,21 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 	bluetooth_rfkill = NULL;
 	wwan_rfkill = NULL;
 	rfkill2_count = 0;
+		if (is_omen_thermal_profile() || is_victus_thermal_profile() || is_victus_s_thermal_profile()) {
+		err = hp_wmi_gpu_mode_setup();
+		if (!err) {
+			err = device_create_file(&device->dev, &dev_attr_graphics_mode);
+			if (err)
+				pr_warn("Failed to create graphics_mode: %d\n", err);
 
+			err = device_create_file(&device->dev, &dev_attr_graphics_modes);
+			if (err)
+				pr_warn("Failed to create graphics_modes: %d\n", err);
+		} else {
+			pr_info("Graphics mode not supported on this board: %d\n", err);
+			gpu_mode_support = false;
+		}
+	}
 	/*
 	 * In pre-2009 BIOS, command 1Bh return 0x4 to indicate that
 	 * BIOS no longer controls the power for the wireless
