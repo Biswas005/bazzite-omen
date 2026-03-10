@@ -815,7 +815,7 @@ static int hp_wmi_get_gpu_mode(enum hp_wmi_gpu_mode *mode)
 	ret = hp_wmi_perform_query(HPWMI_GET_GRAPHICS_MODE_QUERY,
 				   HPWMI_GM,
 				   data,
-				   sizeof(u8),
+				   sizeof(data),
 				   sizeof(data));
 	if (ret)
 		return ret < 0 ? ret : -EINVAL;
@@ -2452,18 +2452,18 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 	rfkill2_count = 0;
 		if (is_omen_thermal_profile() || is_victus_thermal_profile() || is_victus_s_thermal_profile()) {
 		err = hp_wmi_gpu_mode_setup();
-		if (!err) {
-			err = device_create_file(&device->dev, &dev_attr_graphics_mode);
-			if (err)
-				pr_warn("Failed to create graphics_mode: %d\n", err);
+if (!err) {
+    err = device_create_file(&device->dev, &dev_attr_graphics_mode);
+    if (err)
+        pr_warn("Failed to create graphics_mode: %d\n", err);
 
-			err = device_create_file(&device->dev, &dev_attr_graphics_modes);
-			if (err)
-				pr_warn("Failed to create graphics_modes: %d\n", err);
-		} else {
-			pr_info("Graphics mode not supported on this board: %d\n", err);
-			gpu_mode_support = false;
-		}
+    err = device_create_file(&device->dev, &dev_attr_graphics_modes);
+    if (err)
+        pr_warn("Failed to create graphics_modes: %d\n", err);
+} else {
+    pr_info("Graphics mode not supported (WMI query returned %d)\n", err);
+    gpu_mode_support = false;
+}
 	}
 	/*
 	 * In pre-2009 BIOS, command 1Bh return 0x4 to indicate that
