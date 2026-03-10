@@ -859,7 +859,7 @@ static int hp_wmi_set_gpu_mode(enum hp_wmi_gpu_mode mode)
 	ret = hp_wmi_perform_query(HPWMI_SET_GRAPHICS_MODE_QUERY,
 				   HPWMI_GM,
 				   data,
-				   sizeof(u8),
+				   sizeof(data),
 				   sizeof(data));
 	if (ret)
 		return ret < 0 ? ret : -EINVAL;
@@ -2507,6 +2507,10 @@ static void __exit hp_wmi_bios_remove(struct platform_device *device)
 	if (wwan_rfkill) {
 		rfkill_unregister(wwan_rfkill);
 		rfkill_destroy(wwan_rfkill);
+	}
+	if (gpu_mode_support) {
+    device_remove_file(&device->dev, &dev_attr_graphics_mode);
+    device_remove_file(&device->dev, &dev_attr_graphics_modes);
 	}
 
 	priv = platform_get_drvdata(device);
