@@ -2450,7 +2450,7 @@ static int __init hp_wmi_bios_setup(struct platform_device *device)
 	bluetooth_rfkill = NULL;
 	wwan_rfkill = NULL;
 	rfkill2_count = 0;
-		if (is_omen_thermal_profile() || is_victus_thermal_profile() || is_victus_s_thermal_profile()) {
+		{
 		err = hp_wmi_gpu_mode_setup();
 if (!err) {
     err = device_create_file(&device->dev, &dev_attr_graphics_mode);
