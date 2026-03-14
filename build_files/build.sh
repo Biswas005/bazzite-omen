@@ -377,25 +377,10 @@ VSCODE_REPO_EOF
 dnf5 install -y code
 echo "Visual Studio Code installed successfully!"
 
-# Install Brave Browser
+# Install firefox Browser
 ########################
+dnf5 install firefox
 
-echo "Installing Brave Browser..."
-
-# Import Brave's GPG key
-rpm --import https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
-
-# Create Brave browser repository file manually
-cat > /etc/yum.repos.d/brave-browser.repo << 'BRAVE_REPO_EOF'
-[brave-browser]
-name=Brave Browser
-baseurl=https://brave-browser-rpm-release.s3.brave.com/x86_64/
-enabled=1
-gpgcheck=1
-gpgkey=https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
-BRAVE_REPO_EOF
-
-dnf5 install -y brave-browser
 # Enable services
 systemctl enable podman.socket
 
