@@ -379,7 +379,7 @@ echo "Visual Studio Code installed successfully!"
 
 # Install firefox Browser
 ########################
-dnf5 install firefox
+dnf5 install -y firefox
 
 # Enable services
 systemctl enable podman.socket
