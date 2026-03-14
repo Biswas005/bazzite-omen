@@ -395,7 +395,7 @@ gpgcheck=1
 gpgkey=https://brave-browser-rpm-release.s3.brave.com/brave-core.asc
 BRAVE_REPO_EOF
 
-dnf5 install -y brave
+dnf5 install -y brave-browser
 # Enable services
 systemctl enable podman.socket
 
