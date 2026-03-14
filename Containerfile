@@ -1,14 +1,16 @@
-ARG BASE_IMAGE=ghcr.io/ublue-os/bazzite-nvidia:stable
-
+# Stage to copy build files
 FROM scratch AS ctx
 COPY build_files /
 
-FROM ${BASE_IMAGE}
+# Base Image
+FROM ghcr.io/ublue-os/bazzite-nvidia:latest
 
+# Build arguments for module signing secrets
 ARG module_signing_key
-ARG module_signing_crt
+ARG module_signing_crt  
 ARG module_signing_der
 
+# Create temporary directory for secrets and decode them
 RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
     --mount=type=cache,dst=/var/cache \
     --mount=type=cache,dst=/var/log \
