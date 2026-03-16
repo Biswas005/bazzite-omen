@@ -381,6 +381,24 @@ echo "Visual Studio Code installed successfully!"
 ########################
 dnf5 install -y firefox
 
+
+# Replace power-profiles-daemon → TLP (better battery tuning on laptops like Omen)
+rpm-ostree override remove \
+    power-profiles-daemon \
+    tuned-ppd tuned tuned-profiles-* \
+  || true
+
+rpm-ostree install \
+    tlp \
+    tlp-rdw
+    # Optional but recommended for full power-profilesctl compatibility (GNOME/KDE/Steam Deck UI):
+    # tlp-pd    # ← only if available in Fedora repos by your build time (check later)
+
+# Mask the old service so nothing accidentally starts it
+# (this survives ostree upgrades)
+systemctl mask power-profiles-daemon.service || true
+
+
 # Enable services
 systemctl enable podman.socket
 
