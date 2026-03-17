@@ -384,15 +384,11 @@ dnf5 install -y firefox
 
 
 # Replace power-profiles-daemon → TLP (better battery tuning on laptops like Omen)
-rpm-ostree override remove \
-    power-profiles-daemon \
-    tuned-ppd tuned tuned-profiles-* \
-  || true
+dnf5  remove -y tuned tuned-ppd  power-profiles-daemon
 
-rpm-ostree install \
-    tlp \
-    tlp-rdw \
-	toolbox
+dnf5 -y install https://repo.linrunner.de/fedora/tlp/repos/releases/tlp-release.fc$(rpm -E %fedora).noarch.rpm
+dnf5 install -y tlp tlp-pd tlp-rdw
+rpm-ostree install toolbox
     # Optional but recommended for full power-profilesctl compatibility (GNOME/KDE/Steam Deck UI):
     # tlp-pd    # ← only if available in Fedora repos by your build time (check later)
 
